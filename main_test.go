@@ -291,6 +291,55 @@ func TestHandleExportPromptsForSelectionAndPath(t *testing.T) {
 	}
 }
 
+func TestHandleExportUsesDefaultPathWhenInputIsBlank(t *testing.T) {
+	tempDir := t.TempDir()
+	activeHome := filepath.Join(tempDir, "active")
+	storeHome := filepath.Join(tempDir, "store")
+
+	t.Setenv("CODEX_HOME", activeHome)
+	t.Setenv("CODEX_SWITCH_HOME", storeHome)
+
+	if err := os.MkdirAll(activeHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(activeHome, "auth.json"), buildMainTestOAuthAuth(t, "Work", "work@example.com", "acct-work", "user-work"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	application, err := app.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := application.AddCurrent("work", false); err != nil {
+		t.Fatal(err)
+	}
+
+	application.Stdin = bytes.NewBufferString("work\n\n")
+	var stdout bytes.Buffer
+	application.Stdout = &stdout
+
+	previousExport := exportAuthAccount
+	selectedPath := ""
+	exportAuthAccount = func(application *app.App, name, targetPath string) (*store.Record, string, error) {
+		selectedPath = targetPath
+		return &store.Record{Name: name}, targetPath, nil
+	}
+	defer func() {
+		exportAuthAccount = previousExport
+	}()
+
+	if err := handleExport(application, nil); err != nil {
+		t.Fatal(err)
+	}
+	want := defaultExportAuthPaths(application, "work")[0]
+	if selectedPath != want {
+		t.Fatalf("expected default export path %q, got %q", want, selectedPath)
+	}
+	if !strings.Contains(stdout.String(), absolutePathOrOriginal(want)) {
+		t.Fatalf("expected export output to include absolute path, got %q", stdout.String())
+	}
+}
+
 func TestHandleExportHomePromptsForSelectionAndDirectory(t *testing.T) {
 	tempDir := t.TempDir()
 	activeHome := filepath.Join(tempDir, "active")
@@ -335,6 +384,62 @@ func TestHandleExportHomePromptsForSelectionAndDirectory(t *testing.T) {
 	}
 	if selectedName != "work" || selectedDir != "D:/CodexHomes/work" {
 		t.Fatalf("unexpected export-home args: %q %q", selectedName, selectedDir)
+	}
+}
+
+func TestHandleExportHomeCanSelectDefaultDirectoryByIndex(t *testing.T) {
+	tempDir := t.TempDir()
+	activeHome := filepath.Join(tempDir, "active")
+	storeHome := filepath.Join(tempDir, "store")
+
+	t.Setenv("CODEX_HOME", activeHome)
+	t.Setenv("CODEX_SWITCH_HOME", storeHome)
+
+	if err := os.MkdirAll(activeHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(activeHome, "auth.json"), buildMainTestOAuthAuth(t, "Work", "work@example.com", "acct-work", "user-work"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	application, err := app.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := application.AddCurrent("work", false); err != nil {
+		t.Fatal(err)
+	}
+
+	application.Stdin = bytes.NewBufferString("work\n2\n")
+	var stdout bytes.Buffer
+	application.Stdout = &stdout
+
+	previousExportHome := exportHomeAccount
+	selectedDir := ""
+	exportHomeAccount = func(application *app.App, name, dir string, copyConfig bool) (*store.Record, string, error) {
+		selectedDir = dir
+		return &store.Record{Name: name}, dir, nil
+	}
+	defer func() {
+		exportHomeAccount = previousExportHome
+	}()
+
+	if err := handleExportHome(application, nil); err != nil {
+		t.Fatal(err)
+	}
+	want := defaultExportHomePaths(application, "work")[1]
+	if selectedDir != want {
+		t.Fatalf("expected default export-home dir %q, got %q", want, selectedDir)
+	}
+}
+
+func TestLocalFileURIUsesFileScheme(t *testing.T) {
+	got := localFileURI(`C:\Users\Chen\cc-3-auth.json`)
+	if !strings.HasPrefix(got, "file:///") {
+		t.Fatalf("expected file URI, got %q", got)
+	}
+	if !strings.Contains(strings.ToLower(got), "cc-3-auth.json") {
+		t.Fatalf("expected file URI to contain filename, got %q", got)
 	}
 }
 

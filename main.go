@@ -5,7 +5,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -113,6 +115,13 @@ func (ui terminalUI) accent(text string) string  { return ui.style(text, "96") }
 func (ui terminalUI) success(text string) string { return ui.style(text, "92") }
 func (ui terminalUI) warning(text string) string { return ui.style(text, "93") }
 func (ui terminalUI) danger(text string) string  { return ui.style(text, "91") }
+
+func (ui terminalUI) link(text, target string) string {
+	if !ui.styled || strings.TrimSpace(text) == "" || strings.TrimSpace(target) == "" {
+		return text
+	}
+	return "\x1b]8;;" + target + "\x1b\\" + text + "\x1b]8;;\x1b\\"
+}
 
 func (ui terminalUI) sectionTitle(title string) string {
 	if ui.styled {
@@ -939,10 +948,22 @@ func interactiveAccountSuggestions(application *app.App, commandName string, fie
 			return realtimeCommandSuggestions{Hint: "hint: /run <account> [--home <dir>] [--cd <dir>] [-- <codex args...>]"}
 		}
 	case "export-home":
+		if len(positionals) == 1 && hasTrailingSpace {
+			return realtimeCommandSuggestions{Matches: exportHomePathSuggestionItems(application, positionals[0])}
+		}
+		if len(positionals) >= 2 && !hasTrailingSpace {
+			return realtimeCommandSuggestions{Matches: filterSuggestionItems(exportHomePathSuggestionItems(application, positionals[0]), positionals[len(positionals)-1])}
+		}
 		if len(positionals) >= 1 && hasTrailingSpace {
 			return realtimeCommandSuggestions{Hint: "hint: /export-home <account> <dir> [--no-copy-config]"}
 		}
 	case "export":
+		if len(positionals) == 1 && hasTrailingSpace {
+			return realtimeCommandSuggestions{Matches: exportAuthPathSuggestionItems(application, positionals[0])}
+		}
+		if len(positionals) >= 2 && !hasTrailingSpace {
+			return realtimeCommandSuggestions{Matches: filterSuggestionItems(exportAuthPathSuggestionItems(application, positionals[0]), positionals[len(positionals)-1])}
+		}
 		if len(positionals) >= 1 && hasTrailingSpace {
 			return realtimeCommandSuggestions{Hint: "hint: /export <account> <auth.json path>"}
 		}
@@ -1884,7 +1905,7 @@ func handleExport(application *app.App, args []string) error {
 	}
 
 	if strings.TrimSpace(targetPath) == "" {
-		input, err := promptTextInput(application, fmt.Sprintf("请输入账号 %q 的导出 auth.json 路径，直接回车取消: ", name))
+		input, err := promptTextInputWithDefaults(application, fmt.Sprintf("请选择账号 %q 的导出 auth.json 路径", name), defaultExportAuthPaths(application, name))
 		if err != nil {
 			return err
 		}
@@ -1897,7 +1918,7 @@ func handleExport(application *app.App, args []string) error {
 	}
 	ui := uiForApp(application)
 	ui.Println(ui.sectionTitle(fmt.Sprintf("已将账号 %q 导出到 %s", record.Name, targetPath)))
-	printAccountRecordCard(ui, *record, false, [][2]string{{"导出路径", targetPath}})
+	printAccountRecordCard(ui, *record, false, exportPathExtras(ui, "导出路径", targetPath, "打开文件"))
 	return nil
 }
 
@@ -1932,7 +1953,7 @@ func handleExportHome(application *app.App, args []string) error {
 	}
 
 	if strings.TrimSpace(dir) == "" {
-		input, err := promptTextInput(application, fmt.Sprintf("请输入账号 %q 的导出目录，直接回车取消: ", name))
+		input, err := promptTextInputWithDefaults(application, fmt.Sprintf("请选择账号 %q 的导出目录", name), defaultExportHomePaths(application, name))
 		if err != nil {
 			return err
 		}
@@ -1946,7 +1967,7 @@ func handleExportHome(application *app.App, args []string) error {
 
 	ui := uiForApp(application)
 	ui.Println(ui.sectionTitle(fmt.Sprintf("已导出账号 %q 到 %s", record.Name, targetHome)))
-	printAccountRecordCard(ui, *record, false, [][2]string{{"导出 Home", targetHome}})
+	printAccountRecordCard(ui, *record, false, exportPathExtras(ui, "导出 Home", targetHome, "打开目录"))
 	ui.Println("")
 	ui.Println(ui.sectionTitle("可用以下方式启动隔离实例"))
 	ui.Println(formatDetailLine(ui, "Step 1", shellEnvSetCommand(runtime.GOOS, "CODEX_HOME", targetHome)))
@@ -2010,6 +2031,193 @@ func displayOr(value, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func defaultExportBaseName(name string) string {
+	base := store.ShellName(name)
+	if strings.TrimSpace(base) == "" {
+		return "codex-account"
+	}
+	return base
+}
+
+func uniquePaths(paths []string) []string {
+	seen := make(map[string]struct{}, len(paths))
+	result := make([]string, 0, len(paths))
+	for _, path := range paths {
+		path = filepath.Clean(strings.TrimSpace(path))
+		if path == "" {
+			continue
+		}
+		key := strings.ToLower(path)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, path)
+	}
+	return result
+}
+
+func defaultExportAuthPaths(application *app.App, name string) []string {
+	base := defaultExportBaseName(name)
+	paths := []string{
+		base + "-auth.json",
+		filepath.Join("exports", base+"-auth.json"),
+	}
+	if application != nil && application.Store != nil {
+		paths = append(paths, filepath.Join(application.Store.Root(), "exports", base+"-auth.json"))
+	}
+	return uniquePaths(paths)
+}
+
+func defaultExportHomePaths(application *app.App, name string) []string {
+	base := "codex-" + defaultExportBaseName(name)
+	paths := []string{
+		base,
+		filepath.Join("exports", base),
+	}
+	if application != nil && application.Store != nil {
+		paths = append(paths, filepath.Join(application.Store.Root(), "exports", base))
+	}
+	return uniquePaths(paths)
+}
+
+func exportAuthPathSuggestionItems(application *app.App, name string) []realtimeSuggestionItem {
+	paths := defaultExportAuthPaths(application, name)
+	if len(paths) == 0 {
+		return nil
+	}
+	items := make([]realtimeSuggestionItem, 0, len(paths))
+	for index, path := range paths {
+		summary := "默认导出 auth.json 路径"
+		switch index {
+		case 0:
+			summary = "默认: 当前目录"
+		case 1:
+			summary = "默认: 当前目录 exports"
+		case 2:
+			summary = "默认: codex-switch store exports"
+		}
+		items = append(items, realtimeSuggestionItem{
+			Group:   "paths",
+			Value:   path,
+			Summary: summary,
+		})
+	}
+	return items
+}
+
+func exportHomePathSuggestionItems(application *app.App, name string) []realtimeSuggestionItem {
+	paths := defaultExportHomePaths(application, name)
+	if len(paths) == 0 {
+		return nil
+	}
+	items := make([]realtimeSuggestionItem, 0, len(paths))
+	for index, path := range paths {
+		summary := "默认导出 home 路径"
+		switch index {
+		case 0:
+			summary = "默认: 当前目录"
+		case 1:
+			summary = "默认: 当前目录 exports"
+		case 2:
+			summary = "默认: codex-switch store exports"
+		}
+		items = append(items, realtimeSuggestionItem{
+			Group:   "paths",
+			Value:   path,
+			Summary: summary,
+		})
+	}
+	return items
+}
+
+func promptTextInputWithDefaults(application *app.App, prompt string, defaults []string) (string, error) {
+	if application == nil || application.Stdin == nil {
+		return "", fmt.Errorf("缺少交互输入")
+	}
+
+	defaults = uniquePaths(defaults)
+	if len(defaults) == 0 {
+		return promptTextInput(application, prompt)
+	}
+
+	writer := io.Writer(os.Stdout)
+	if application.Stdout != nil {
+		writer = application.Stdout
+	}
+	ui := newTerminalUI(writer)
+	if _, err := fmt.Fprintln(writer, ui.sectionTitle(prompt)); err != nil {
+		return "", err
+	}
+	for index, path := range defaults {
+		tag := ui.badge("default", "accent")
+		if index == 0 {
+			tag = ui.badge("recommended", "success")
+		}
+		if _, err := fmt.Fprintf(writer, "  %d. %s %s\n", index+1, ui.strong(path), tag); err != nil {
+			return "", err
+		}
+	}
+	if _, err := fmt.Fprintf(writer, "%s 直接回车使用默认值，也可输入序号或自定义路径: ", ui.accent(">")); err != nil {
+		return "", err
+	}
+
+	line, readErr := readPromptLine(application)
+	if readErr != nil {
+		return "", readErr
+	}
+	value := strings.TrimSpace(line)
+	if value == "" {
+		return defaults[0], nil
+	}
+	if index, err := parseSelectionIndex(value, len(defaults)); err == nil {
+		return defaults[index], nil
+	}
+	return value, nil
+}
+
+func absolutePathOrOriginal(path string) string {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(trimmed)
+	if err != nil {
+		return filepath.Clean(trimmed)
+	}
+	return abs
+}
+
+func localFileURI(path string) string {
+	abs := absolutePathOrOriginal(path)
+	if abs == "" {
+		return ""
+	}
+	slashPath := filepath.ToSlash(abs)
+	if !strings.HasPrefix(slashPath, "/") {
+		slashPath = "/" + slashPath
+	}
+	return (&url.URL{Scheme: "file", Path: slashPath}).String()
+}
+
+func exportPathExtras(ui terminalUI, label, path, linkLabel string) [][2]string {
+	abs := absolutePathOrOriginal(path)
+	actualValue := abs
+	linkValue := ""
+	if abs != "" {
+		actualValue = ui.link(abs, localFileURI(abs))
+		linkValue = ui.link(linkLabel, localFileURI(abs))
+	}
+	extras := [][2]string{
+		{label, path},
+		{"实际路径", actualValue},
+	}
+	if strings.TrimSpace(linkValue) != "" {
+		extras = append(extras, [2]string{"本地链接", linkValue})
+	}
+	return extras
 }
 
 func printAccountSnapshot(ui terminalUI, title string, record *store.Record, extras [][2]string) {
