@@ -1,0 +1,13 @@
+.p/
+.build/
+.tmp/
+
+# Built binaries
+/codex-switch
+/codex-switch.exe
+*.test
+*.out
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
