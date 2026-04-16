@@ -470,7 +470,7 @@ func TestInteractiveShellSlashShowsCommandTable(t *testing.T) {
 	}
 }
 
-func TestInteractiveShellResolvesUniqueCommandPrefix(t *testing.T) {
+func TestInteractiveShellRejectsCommandPrefixOnEnter(t *testing.T) {
 	var stdout bytes.Buffer
 	fakeApp := &app.App{
 		Stdin:  bytes.NewBufferString("/sw work\n/exit\n"),
@@ -478,50 +478,62 @@ func TestInteractiveShellResolvesUniqueCommandPrefix(t *testing.T) {
 		Stderr: &stdout,
 	}
 
-	previousSwitch := switchAccount
-	selected := ""
-	switchAccount = func(application *app.App, name string) (*store.Record, string, error) {
-		selected = name
-		return &store.Record{Name: name}, "", nil
-	}
-	defer func() {
-		switchAccount = previousSwitch
-	}()
-
 	if err := runInteractiveShell(fakeApp); err != nil {
 		t.Fatal(err)
 	}
-	if selected != "work" {
-		t.Fatalf("expected prefix command to target work, got %q", selected)
+	if !strings.Contains(stdout.String(), `错误: 未知命令 "/sw"。输入 /help 查看可用命令`) {
+		t.Fatalf("expected prefix command to be rejected, got %q", stdout.String())
 	}
 }
 
-func TestInteractiveShellAmbiguousPrefixPromptsForSelection(t *testing.T) {
+func TestInteractiveShellRejectsAmbiguousCommandPrefixOnEnter(t *testing.T) {
 	var stdout bytes.Buffer
 	fakeApp := &app.App{
-		Stdin:  bytes.NewBufferString("/r work\n/run\n/exit\n"),
+		Stdin:  bytes.NewBufferString("/r work\n/exit\n"),
 		Stdout: &stdout,
 		Stderr: &stdout,
 	}
 
-	previousRun := runAccount
-	selectedName := ""
-	runAccount = func(application *app.App, name string, opts app.RunOptions) (string, error) {
-		selectedName = name
-		return "D:/CodexHomes/work", nil
-	}
-	defer func() {
-		runAccount = previousRun
-	}()
-
 	if err := runInteractiveShell(fakeApp); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(stdout.String(), `匹配到多个命令（"/r"）`) {
-		t.Fatalf("expected ambiguous prefix prompt, got %q", stdout.String())
+	if !strings.Contains(stdout.String(), `错误: 未知命令 "/r"。输入 /help 查看可用命令`) {
+		t.Fatalf("expected ambiguous prefix command to be rejected, got %q", stdout.String())
 	}
-	if selectedName != "work" {
-		t.Fatalf("expected selected run command to receive work, got %q", selectedName)
+}
+
+func TestInputReaderCachesBufferedReaderWithoutReplacingStdin(t *testing.T) {
+	source := bytes.NewBufferString("first\nsecond\n")
+	application := &app.App{Stdin: source}
+
+	reader := inputReader(application)
+	if reader == nil {
+		t.Fatal("expected reader")
+	}
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	if line != "first\n" {
+		t.Fatalf("expected first line, got %q", line)
+	}
+	if application.Stdin != source {
+		t.Fatal("expected application stdin to remain unchanged")
+	}
+	if application.InputReader != reader {
+		t.Fatal("expected cached input reader")
+	}
+
+	readerAgain := inputReader(application)
+	if readerAgain != reader {
+		t.Fatal("expected inputReader to reuse cached reader")
+	}
+	line, err = readerAgain.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	if line != "second\n" {
+		t.Fatalf("expected second line, got %q", line)
 	}
 }
 
@@ -616,7 +628,7 @@ func TestInteractiveShellPromptShowsUntrackedContext(t *testing.T) {
 	}
 }
 
-func TestInteractiveShellDispatchesRenamePrefixCommandWithQuotes(t *testing.T) {
+func TestInteractiveShellDispatchesRenameCommandWithQuotes(t *testing.T) {
 	tempDir := t.TempDir()
 	activeHome := filepath.Join(tempDir, "active")
 	storeHome := filepath.Join(tempDir, "store")
@@ -640,7 +652,7 @@ func TestInteractiveShellDispatchesRenamePrefixCommandWithQuotes(t *testing.T) {
 	}
 
 	var stdout bytes.Buffer
-	application.Stdin = bytes.NewBufferString(`/ren --from "Jerry Butler" --to jerry-butler` + "\n/exit\n")
+	application.Stdin = bytes.NewBufferString(`/rename --from "Jerry Butler" --to jerry-butler` + "\n/exit\n")
 	application.Stdout = &stdout
 	application.Stderr = &stdout
 
@@ -648,7 +660,7 @@ func TestInteractiveShellDispatchesRenamePrefixCommandWithQuotes(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := application.Store.Load("jerry-butler"); err != nil {
-		t.Fatalf("expected prefix rename command to rename account, got %v", err)
+		t.Fatalf("expected rename command to rename account, got %v", err)
 	}
 }
 
@@ -699,6 +711,18 @@ func TestAutocompleteInteractiveLineUsesSelectedSuggestion(t *testing.T) {
 	}
 	if got := autocompleteInteractiveLine(nil, "/r", 1); got != "/rename " {
 		t.Fatalf("unexpected autocomplete with selection: %q", got)
+	}
+}
+
+func TestApplySelectedSuggestionOnEnterHonorsArrowSelection(t *testing.T) {
+	if got := string(applySelectedSuggestionOnEnter(nil, []byte("/r"), 1, true, true)); got != "/rename " {
+		t.Fatalf("expected enter to accept selected suggestion, got %q", got)
+	}
+}
+
+func TestApplySelectedSuggestionOnEnterDoesNotAutocompleteWithoutArrowSelection(t *testing.T) {
+	if got := string(applySelectedSuggestionOnEnter(nil, []byte("/r"), 1, false, true)); got != "/r" {
+		t.Fatalf("expected enter without arrow selection to keep input, got %q", got)
 	}
 }
 

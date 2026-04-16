@@ -57,6 +57,148 @@ type realtimeSuggestionItem struct {
 	Summary string
 }
 
+type realtimeShellSession struct {
+	input *os.File
+	state *term.State
+}
+
+var activeRealtimeShellSession *realtimeShellSession
+
+type terminalUI struct {
+	writer io.Writer
+	styled bool
+}
+
+func newTerminalUI(writer io.Writer) terminalUI {
+	styled := false
+	if file, ok := writer.(*os.File); ok {
+		styled = term.IsTerminal(int(file.Fd()))
+	}
+	return terminalUI{writer: writer, styled: styled}
+}
+
+func uiWriter(application *app.App) io.Writer {
+	if application != nil && application.Stdout != nil {
+		return application.Stdout
+	}
+	return os.Stdout
+}
+
+func uiForApp(application *app.App) terminalUI {
+	return newTerminalUI(uiWriter(application))
+}
+
+func (ui terminalUI) Print(text string) {
+	_, _ = fmt.Fprint(ui.writer, text)
+}
+
+func (ui terminalUI) Println(text string) {
+	_, _ = fmt.Fprintln(ui.writer, text)
+}
+
+func (ui terminalUI) Printf(format string, args ...any) {
+	_, _ = fmt.Fprintf(ui.writer, format, args...)
+}
+
+func (ui terminalUI) style(text string, codes ...string) string {
+	if !ui.styled || text == "" {
+		return text
+	}
+	return "\x1b[" + strings.Join(codes, ";") + "m" + text + "\x1b[0m"
+}
+
+func (ui terminalUI) strong(text string) string  { return ui.style(text, "1", "97") }
+func (ui terminalUI) muted(text string) string   { return ui.style(text, "90") }
+func (ui terminalUI) accent(text string) string  { return ui.style(text, "96") }
+func (ui terminalUI) success(text string) string { return ui.style(text, "92") }
+func (ui terminalUI) warning(text string) string { return ui.style(text, "93") }
+func (ui terminalUI) danger(text string) string  { return ui.style(text, "91") }
+
+func (ui terminalUI) sectionTitle(title string) string {
+	if ui.styled {
+		return ui.strong(title)
+	}
+	return "== " + title + " =="
+}
+
+func (ui terminalUI) badge(text, tone string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	plain := "[" + text + "]"
+	switch tone {
+	case "success":
+		return ui.success(plain)
+	case "warning":
+		return ui.warning(plain)
+	case "danger":
+		return ui.danger(plain)
+	case "muted":
+		return ui.muted(plain)
+	default:
+		return ui.accent(plain)
+	}
+}
+
+func formatDetailLine(ui terminalUI, label, value string) string {
+	return "  " + ui.muted(fmt.Sprintf("%-10s", label)) + " " + value
+}
+
+func formatItemHeader(ui terminalUI, current bool, title string, badges ...string) string {
+	marker := ui.muted("-")
+	if current {
+		marker = ui.success("*")
+	}
+	parts := make([]string, 0, len(badges))
+	for _, badge := range badges {
+		if strings.TrimSpace(badge) != "" {
+			parts = append(parts, badge)
+		}
+	}
+	line := marker + " " + ui.strong(title)
+	if len(parts) > 0 {
+		line += " " + strings.Join(parts, " ")
+	}
+	return line
+}
+
+func quotaTone(percent int) string {
+	switch {
+	case percent >= 70:
+		return "success"
+	case percent >= 30:
+		return "warning"
+	default:
+		return "danger"
+	}
+}
+
+func formatQuotaValue(ui terminalUI, percent int) string {
+	return ui.badge(fmt.Sprintf("%d%%", percent), quotaTone(percent))
+}
+
+func planBadge(ui terminalUI, plan string) string {
+	switch strings.ToLower(strings.TrimSpace(plan)) {
+	case "":
+		return ""
+	case "plus", "pro", "team":
+		return ui.badge(plan, "success")
+	case "free":
+		return ui.badge(plan, "muted")
+	default:
+		return ui.badge(plan, "accent")
+	}
+}
+
+func aliasBadge(ui terminalUI, name string) string {
+	shellName := store.ShellName(name)
+	if shellName == "" || strings.EqualFold(shellName, name) {
+		return ""
+	}
+	return ui.badge(shellName, "accent")
+}
+
 var interactiveShellCommands = []shellCommandSpec{
 	{Name: "help", Aliases: []string{"h", "?"}, Summary: "显示帮助"},
 	{Name: "add", Summary: "保存当前登录态"},
@@ -171,8 +313,7 @@ Commands:
 Interactive Shell:
   直接运行 codex-switch 可进入交互 Shell。
   所有命令都必须以 / 开头，例如 /help、/switch、/exit。
-  支持命令前缀匹配，例如 /sw、/st、/ren。
-  当前缀匹配到多个命令时，会动态展示候选列表并支持按序号或命令名选择。
+  输入时会实时展示匹配建议，可用 Tab、右方向键或上下键加回车接收补全。
   输入 / 可显示全部命令，输入 /exit、/quit 或 /q 退出。
 
 Examples:
@@ -195,17 +336,18 @@ Examples:
 }
 
 func runInteractiveShell(application *app.App) error {
-	writer := io.Writer(os.Stdout)
-	if application.Stdout != nil {
-		writer = application.Stdout
-	}
-	if _, err := fmt.Fprintln(writer, "codex-switch shell"); err != nil {
+	writer := uiWriter(application)
+	ui := newTerminalUI(writer)
+	if _, err := fmt.Fprintln(writer, ui.sectionTitle("codex-switch shell")); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintln(writer, "Commands start with /. Type / to browse commands, /help for help, and /exit to quit."); err != nil {
+	if _, err := fmt.Fprintln(writer, ui.muted("Commands start with /. Type / to browse commands, /help for help, and /exit to quit.")); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(writer, "Context: %s\n", interactiveShellContext(application)); err != nil {
+	if _, err := fmt.Fprintf(writer, "Context: %s\n", ui.accent(interactiveShellContext(application))); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintln(writer); err != nil {
 		return err
 	}
 
@@ -255,7 +397,12 @@ func runRealtimeInteractiveShell(application *app.App) error {
 	if err != nil {
 		return runLineInteractiveShell(application, outputFile)
 	}
+	activeRealtimeShellSession = &realtimeShellSession{
+		input: inputFile,
+		state: state,
+	}
 	defer func() {
+		activeRealtimeShellSession = nil
 		_ = term.Restore(int(inputFile.Fd()), state)
 		fmt.Fprint(outputFile, "\r\n")
 	}()
@@ -263,6 +410,7 @@ func runRealtimeInteractiveShell(application *app.App) error {
 	buffer := make([]byte, 0, 128)
 	renderedLines := 0
 	selectedSuggestion := 0
+	selectionArmed := false
 	suggestionsVisible := true
 	for {
 		renderedLines, selectedSuggestion, err = renderInteractiveInput(outputFile, renderedLines, application, interactiveShellPrompt(application), string(buffer), selectedSuggestion, suggestionsVisible)
@@ -280,11 +428,13 @@ func runRealtimeInteractiveShell(application *app.App) error {
 
 		switch b[0] {
 		case '\r', '\n':
+			buffer = applySelectedSuggestionOnEnter(application, buffer, selectedSuggestion, selectionArmed, suggestionsVisible)
 			fmt.Fprint(outputFile, "\r\n")
 			renderedLines = 0
 			line := strings.TrimSpace(string(buffer))
 			buffer = buffer[:0]
 			selectedSuggestion = 0
+			selectionArmed = false
 			suggestionsVisible = true
 			if line == "" {
 				continue
@@ -303,6 +453,7 @@ func runRealtimeInteractiveShell(application *app.App) error {
 				buffer = buffer[:len(buffer)-1]
 			}
 			selectedSuggestion = 0
+			selectionArmed = false
 			suggestionsVisible = true
 		case '\t':
 			completed := autocompleteInteractiveLine(application, string(buffer), selectedSuggestion)
@@ -310,6 +461,7 @@ func runRealtimeInteractiveShell(application *app.App) error {
 				buffer = []byte(completed)
 			}
 			selectedSuggestion = 0
+			selectionArmed = false
 			suggestionsVisible = true
 		case 27:
 			action := readEscapeAction(inputFile)
@@ -317,9 +469,11 @@ func runRealtimeInteractiveShell(application *app.App) error {
 			case "up":
 				suggestionsVisible = true
 				selectedSuggestion = moveSuggestionSelectionWithApp(application, string(buffer), selectedSuggestion, -1)
+				selectionArmed = true
 			case "down":
 				suggestionsVisible = true
 				selectedSuggestion = moveSuggestionSelectionWithApp(application, string(buffer), selectedSuggestion, 1)
+				selectionArmed = true
 			case "right":
 				completed := autocompleteInteractiveLine(application, string(buffer), selectedSuggestion)
 				if completed != string(buffer) {
@@ -327,15 +481,18 @@ func runRealtimeInteractiveShell(application *app.App) error {
 				}
 				suggestionsVisible = true
 				selectedSuggestion = 0
+				selectionArmed = false
 			case "escape":
 				suggestionsVisible = false
 				selectedSuggestion = -1
+				selectionArmed = false
 			}
 		default:
 			if b[0] >= 32 && b[0] != 255 {
 				buffer = append(buffer, b[0])
 				suggestionsVisible = true
 				selectedSuggestion = 0
+				selectionArmed = false
 			}
 		}
 	}
@@ -366,10 +523,24 @@ func handleInteractiveLine(application *app.App, writer io.Writer, line string) 
 		return false, nil
 	}
 
-	if runErr := runCommand(application, args, true); runErr != nil {
+	if runErr := runInteractiveShellCommand(application, args); runErr != nil {
 		_, _ = fmt.Fprintf(writer, "错误: %v\n", runErr)
 	}
 	return false, nil
+}
+
+func runInteractiveShellCommand(application *app.App, args []string) (err error) {
+	resume, err := suspendRealtimeShellRawMode(application)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if resumeErr := resume(); err == nil && resumeErr != nil {
+			err = resumeErr
+		}
+	}()
+
+	return runCommand(application, args, true)
 }
 
 func canUseRealtimeShell(application *app.App) bool {
@@ -400,31 +571,46 @@ func interactiveOutputFile(application *app.App) *os.File {
 }
 
 func renderInteractiveInput(writer io.Writer, previousLines int, application *app.App, prompt, line string, selected int, visible bool) (int, int, error) {
+	ui := newTerminalUI(writer)
 	suggestions := interactiveRealtimeSuggestions(application, line)
 	if !visible {
 		suggestions = realtimeCommandSuggestions{}
 	}
 	selected = normalizeSuggestionSelection(len(suggestions.Matches), selected)
+	lines := renderInteractiveSuggestionLines(ui, suggestions, selected)
 	if previousLines > 0 {
 		if _, err := fmt.Fprintf(writer, "\x1b[%dA", previousLines); err != nil {
 			return 0, selected, err
 		}
 	}
-	if _, err := fmt.Fprint(writer, "\r\x1b[J"); err != nil {
+	if _, err := fmt.Fprint(writer, "\x1b[?25l"); err != nil {
 		return 0, selected, err
 	}
+	defer fmt.Fprint(writer, "\x1b[?25h")
 
-	renderedLines := 0
-	for _, suggestion := range renderInteractiveSuggestionLines(suggestions, selected) {
-		if _, err := fmt.Fprintln(writer, suggestion); err != nil {
+	for _, suggestion := range lines {
+		if _, err := fmt.Fprintf(writer, "\r\x1b[2K%s\n", suggestion); err != nil {
 			return 0, selected, err
 		}
-		renderedLines++
 	}
-	if _, err := fmt.Fprintf(writer, "%s%s", prompt, line); err != nil {
+	if _, err := fmt.Fprintf(writer, "\r\x1b[2K%s%s", prompt, line); err != nil {
 		return 0, selected, err
 	}
-	return renderedLines, selected, nil
+	extraLines := previousLines - len(lines)
+	if extraLines > 0 {
+		if _, err := fmt.Fprint(writer, "\x1b[s"); err != nil {
+			return 0, selected, err
+		}
+		for i := 0; i < extraLines; i++ {
+			if _, err := fmt.Fprint(writer, "\n\r\x1b[2K"); err != nil {
+				return 0, selected, err
+			}
+		}
+		if _, err := fmt.Fprint(writer, "\x1b[u"); err != nil {
+			return 0, selected, err
+		}
+	}
+	return len(lines), selected, nil
 }
 
 func parseInteractiveCommand(line string) ([]string, error) {
@@ -446,7 +632,12 @@ func parseInteractiveCommand(line string) ([]string, error) {
 }
 
 func interactiveShellPrompt(application *app.App) string {
-	return fmt.Sprintf("codex-switch[%s]> ", interactiveShellContext(application))
+	context := interactiveShellContext(application)
+	ui := uiForApp(application)
+	if !ui.styled {
+		return fmt.Sprintf("codex-switch[%s]> ", context)
+	}
+	return ui.muted("codex-switch") + ui.accent("["+context+"]") + ui.success("> ")
 }
 
 func interactiveShellContext(application *app.App) string {
@@ -479,6 +670,7 @@ func displayPromptName(name string) string {
 }
 
 func interactiveShellCommandTable() string {
+	ui := newTerminalUI(os.Stdout)
 	var builder strings.Builder
 	builder.WriteString("Available commands:\n")
 	for _, command := range interactiveShellCommands {
@@ -488,11 +680,11 @@ func interactiveShellCommandTable() string {
 			for _, alias := range command.Aliases {
 				prefixedAliases = append(prefixedAliases, "/"+alias)
 			}
-			aliasText = " [" + strings.Join(prefixedAliases, ", ") + "]"
+			aliasText = ui.muted(" [" + strings.Join(prefixedAliases, ", ") + "]")
 		}
-		builder.WriteString(fmt.Sprintf("  %-12s %-20s %s\n", "/"+command.Name, aliasText, command.Summary))
+		builder.WriteString(fmt.Sprintf("  %-12s %-20s %s\n", ui.accent("/"+command.Name), aliasText, command.Summary))
 	}
-	builder.WriteString("Tip: 输入 / 查看全部命令，输入 /<前缀> 匹配命令。")
+	builder.WriteString(ui.muted("Tip: 输入 / 查看全部命令，输入时会实时显示建议并可直接接收补全。"))
 	return builder.String()
 }
 
@@ -540,24 +732,30 @@ func interactiveRealtimeSuggestions(application *app.App, line string) realtimeC
 	return realtimeCommandSuggestions{Matches: commandSuggestionItems([]shellCommandSpec{command})}
 }
 
-func renderInteractiveSuggestionLines(suggestions realtimeCommandSuggestions, selected int) []string {
+func renderInteractiveSuggestionLines(ui terminalUI, suggestions realtimeCommandSuggestions, selected int) []string {
 	if strings.TrimSpace(suggestions.Hint) != "" {
-		return []string{suggestions.Hint}
+		return []string{ui.muted(suggestions.Hint)}
+	}
+	if len(suggestions.Matches) == 0 {
+		return nil
 	}
 
 	lines := make([]string, 0, len(suggestions.Matches)+1)
-	lines = append(lines, "suggestions:")
+	lines = append(lines, ui.muted("suggestions"))
 	lastGroup := ""
 	for index, suggestion := range suggestions.Matches {
 		if suggestion.Group != "" && suggestion.Group != lastGroup {
-			lines = append(lines, "  ["+suggestion.Group+"]")
+			lines = append(lines, "  "+ui.accent("["+suggestion.Group+"]"))
 			lastGroup = suggestion.Group
 		}
 		prefix := "  "
 		if index == selected {
-			prefix = "> "
+			prefix = ui.accent("> ")
+		} else {
+			prefix = ui.muted("  ")
 		}
-		line := fmt.Sprintf("%s%-18s %s", prefix, suggestion.Value, suggestion.Summary)
+		value := fmt.Sprintf("%-18s", suggestion.Value)
+		line := fmt.Sprintf("%s%s %s", prefix, ui.strong(value), ui.muted(suggestion.Summary))
 		if index == selected {
 			line = "\x1b[7m" + line + "\x1b[0m"
 		}
@@ -616,6 +814,17 @@ func autocompleteInteractiveLine(application *app.App, line string, selected int
 		completed += " "
 	}
 	return completed
+}
+
+func applySelectedSuggestionOnEnter(application *app.App, buffer []byte, selected int, armed, visible bool) []byte {
+	if !armed || !visible {
+		return buffer
+	}
+	completed := autocompleteInteractiveLine(application, string(buffer), selected)
+	if completed == string(buffer) {
+		return buffer
+	}
+	return []byte(completed)
 }
 
 func interactiveCompletionRange(line string) (int, int) {
@@ -888,6 +1097,50 @@ func readEscapeSequence(inputFile *os.File) (string, bool) {
 	return "[" + string(second[:]), true
 }
 
+func suspendRealtimeShellRawMode(application *app.App) (func() error, error) {
+	session := activeRealtimeShellSession
+	if session == nil || session.input == nil || session.state == nil {
+		return func() error { return nil }, nil
+	}
+
+	inputFile := interactiveInputFile(application)
+	if inputFile != nil && inputFile != session.input {
+		return func() error { return nil }, nil
+	}
+
+	if err := term.Restore(int(session.input.Fd()), session.state); err != nil {
+		return nil, err
+	}
+
+	return func() error {
+		state, err := term.MakeRaw(int(session.input.Fd()))
+		if err != nil {
+			return err
+		}
+		session.state = state
+		return nil
+	}, nil
+}
+
+func readPromptLine(application *app.App) (line string, err error) {
+	resume, err := suspendRealtimeShellRawMode(application)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		if resumeErr := resume(); err == nil && resumeErr != nil {
+			err = resumeErr
+		}
+	}()
+
+	reader := inputReader(application)
+	line, err = reader.ReadString('\n')
+	if err != nil && err != io.EOF {
+		return "", err
+	}
+	return line, nil
+}
+
 func resolveInteractiveCommand(application *app.App, input string) (string, error) {
 	query := strings.ToLower(strings.TrimSpace(input))
 	if query == "" {
@@ -897,16 +1150,7 @@ func resolveInteractiveCommand(application *app.App, input string) (string, erro
 	if exact, ok := findInteractiveCommandExact(query); ok {
 		return exact.Name, nil
 	}
-
-	matches := findInteractiveCommandMatches(query)
-	switch len(matches) {
-	case 0:
-		return "", fmt.Errorf("未知命令 %q。输入 /help 查看可用命令", "/"+input)
-	case 1:
-		return matches[0].Name, nil
-	default:
-		return promptCommandSelection(application, query, matches)
-	}
+	return "", fmt.Errorf("未知命令 %q。输入 /help 查看可用命令", "/"+input)
 }
 
 func findInteractiveCommandExact(query string) (shellCommandSpec, bool) {
@@ -970,14 +1214,13 @@ func promptCommandSelection(application *app.App, prefix string, matches []shell
 		}
 	}
 
-	reader := inputReader(application)
 	for {
 		if _, err := fmt.Fprint(writer, "输入序号或命令名，直接回车取消: "); err != nil {
 			return "", err
 		}
 
-		line, readErr := reader.ReadString('\n')
-		if readErr != nil && readErr != io.EOF {
+		line, readErr := readPromptLine(application)
+		if readErr != nil {
 			return "", readErr
 		}
 		input := strings.ToLower(strings.TrimSpace(line))
@@ -1120,13 +1363,14 @@ func handlePaths(application *app.App, args []string) error {
 		if err := application.RefreshActivePath(); err != nil {
 			return err
 		}
-		fmt.Printf("已保存 path profile %q\n", profile.Name)
-		fmt.Printf("Home: %s\n", profile.Home)
-		fmt.Printf("Auth: %s\n", codex.AuthFilePath(profile.Home))
+		ui := uiForApp(application)
+		ui.Println(ui.sectionTitle(fmt.Sprintf("已保存 path profile %q", profile.Name)))
+		ui.Println(formatDetailLine(ui, "Home", profile.Home))
+		ui.Println(formatDetailLine(ui, "Auth", codex.AuthFilePath(profile.Home)))
 		if *use {
-			fmt.Printf("已设为当前 path profile\n")
+			ui.Println(formatDetailLine(ui, "状态", "已设为当前 path profile"))
 			if application.ActivePathSource == "env" {
-				fmt.Printf("当前会话仍优先使用 CODEX_HOME=%s\n", application.ActiveHome)
+				ui.Println(formatDetailLine(ui, "提示", "当前会话仍优先使用 CODEX_HOME="+application.ActiveHome))
 			}
 		}
 		return nil
@@ -1141,11 +1385,12 @@ func handlePaths(application *app.App, args []string) error {
 		if err := application.RefreshActivePath(); err != nil {
 			return err
 		}
-		fmt.Printf("已切换到 path profile %q\n", profile.Name)
-		fmt.Printf("Home: %s\n", profile.Home)
-		fmt.Printf("Auth: %s\n", codex.AuthFilePath(profile.Home))
+		ui := uiForApp(application)
+		ui.Println(ui.sectionTitle(fmt.Sprintf("已切换到 path profile %q", profile.Name)))
+		ui.Println(formatDetailLine(ui, "Home", profile.Home))
+		ui.Println(formatDetailLine(ui, "Auth", codex.AuthFilePath(profile.Home)))
 		if application.ActivePathSource == "env" {
-			fmt.Printf("当前会话仍优先使用 CODEX_HOME=%s\n", application.ActiveHome)
+			ui.Println(formatDetailLine(ui, "提示", "当前会话仍优先使用 CODEX_HOME="+application.ActiveHome))
 		}
 		return nil
 	case "remove", "rm", "delete":
@@ -1158,7 +1403,7 @@ func handlePaths(application *app.App, args []string) error {
 		if err := application.RefreshActivePath(); err != nil {
 			return err
 		}
-		fmt.Printf("已删除 path profile %q\n", positionals[0])
+		uiForApp(application).Println(uiForApp(application).sectionTitle(fmt.Sprintf("已删除 path profile %q", positionals[0])))
 		return nil
 	case "reset":
 		if len(positionals) != 0 {
@@ -1170,7 +1415,7 @@ func handlePaths(application *app.App, args []string) error {
 		if err := application.RefreshActivePath(); err != nil {
 			return err
 		}
-		fmt.Printf("已清除当前 path profile 选择\n")
+		uiForApp(application).Println(uiForApp(application).sectionTitle("已清除当前 path profile 选择"))
 		return printCurrentPath(application)
 	default:
 		return fmt.Errorf("未知 paths 子命令: %s", subcommand)
@@ -1178,51 +1423,63 @@ func handlePaths(application *app.App, args []string) error {
 }
 
 func printPathsOverview(application *app.App) error {
+	ui := uiForApp(application)
 	if err := printCurrentPath(application); err != nil {
 		return err
 	}
-	fmt.Println()
-	fmt.Printf("Store root: %s\n", application.Store.Root())
-	fmt.Printf("Accounts:   %s\n", application.Store.AccountsDir())
-	fmt.Printf("Homes:      %s\n", application.Store.HomesDir())
-	fmt.Printf("Backups:    %s\n", application.Store.BackupsDir())
-	fmt.Printf("Profiles:   %s\n", application.Store.PathsConfigPath())
+	ui.Println("")
+	ui.Println(ui.sectionTitle("Store"))
+	ui.Println(formatDetailLine(ui, "root", application.Store.Root()))
+	ui.Println(formatDetailLine(ui, "accounts", application.Store.AccountsDir()))
+	ui.Println(formatDetailLine(ui, "homes", application.Store.HomesDir()))
+	ui.Println(formatDetailLine(ui, "backups", application.Store.BackupsDir()))
+	ui.Println(formatDetailLine(ui, "profiles", application.Store.PathsConfigPath()))
 
 	profiles, currentProfile, err := application.Store.ListPathProfiles()
 	if err != nil {
 		return err
 	}
-	fmt.Println()
-	fmt.Println("Path profiles:")
+	ui.Println("")
+	ui.Println(ui.sectionTitle("Path profiles"))
 	if len(profiles) == 0 {
-		fmt.Println("  (none)")
+		ui.Println(formatDetailLine(ui, "状态", "(none)"))
 		return nil
 	}
 
-	for _, profile := range profiles {
+	for index, profile := range profiles {
+		if index > 0 {
+			ui.Println("")
+		}
 		marker := " "
+		badges := []string{}
 		switch {
 		case application.ActivePathSource == "profile" && strings.EqualFold(application.ActivePathProfile, profile.Name):
 			marker = "*"
+			badges = append(badges, ui.badge("active", "success"))
 		case currentProfile != "" && strings.EqualFold(currentProfile, profile.Name):
 			marker = ">"
+			badges = append(badges, ui.badge("selected", "accent"))
 		}
-		fmt.Printf("  %s %s\n", marker, profile.Name)
-		fmt.Printf("    home: %s\n", profile.Home)
-		fmt.Printf("    auth: %s\n", codex.AuthFilePath(profile.Home))
+		ui.Println(formatItemHeader(ui, marker == "*", profile.Name, badges...))
+		if marker == ">" && marker != "*" {
+			ui.Println(formatDetailLine(ui, "状态", "当前配置选择"))
+		}
+		ui.Println(formatDetailLine(ui, "home", profile.Home))
+		ui.Println(formatDetailLine(ui, "auth", codex.AuthFilePath(profile.Home)))
 	}
 	return nil
 }
 
 func printCurrentPath(application *app.App) error {
-	fmt.Println("Active path:")
-	fmt.Printf("  source: %s\n", application.ActivePathSource)
+	ui := uiForApp(application)
+	ui.Println(ui.sectionTitle("Active path"))
+	ui.Println(formatDetailLine(ui, "source", application.ActivePathSource))
 	if application.ActivePathProfile != "" {
-		fmt.Printf("  profile: %s\n", application.ActivePathProfile)
+		ui.Println(formatDetailLine(ui, "profile", application.ActivePathProfile))
 	}
-	fmt.Printf("  home: %s\n", application.ActiveHome)
-	fmt.Printf("  auth: %s\n", application.ActiveAuthPath)
-	fmt.Printf("  config: %s\n", application.ActiveConfigPath)
+	ui.Println(formatDetailLine(ui, "home", application.ActiveHome))
+	ui.Println(formatDetailLine(ui, "auth", application.ActiveAuthPath))
+	ui.Println(formatDetailLine(ui, "config", application.ActiveConfigPath))
 	return nil
 }
 
@@ -1246,17 +1503,7 @@ func handleAdd(application *app.App, args []string) error {
 	if err != nil {
 		return err
 	}
-
-	fmt.Printf("已保存账号 %q\n", record.Name)
-	if record.Snapshot.AccountName != "" {
-		fmt.Printf("账户名: %s\n", record.Snapshot.AccountName)
-	}
-	if record.Snapshot.Email != "" {
-		fmt.Printf("邮箱: %s\n", record.Snapshot.Email)
-	}
-	if record.Snapshot.Plan != "" {
-		fmt.Printf("套餐: %s\n", record.Snapshot.Plan)
-	}
+	printAccountSnapshot(uiForApp(application), fmt.Sprintf("已保存账号 %q", record.Name), record, nil)
 	return nil
 }
 
@@ -1280,17 +1527,7 @@ func handleLogin(application *app.App, args []string) error {
 	if err != nil {
 		return err
 	}
-
-	fmt.Printf("已登录并保存账号 %q\n", record.Name)
-	if record.Snapshot.AccountName != "" {
-		fmt.Printf("账户名: %s\n", record.Snapshot.AccountName)
-	}
-	if record.Snapshot.Email != "" {
-		fmt.Printf("邮箱: %s\n", record.Snapshot.Email)
-	}
-	if record.Snapshot.Plan != "" {
-		fmt.Printf("套餐: %s\n", record.Snapshot.Plan)
-	}
+	printAccountSnapshot(uiForApp(application), fmt.Sprintf("已登录并保存账号 %q", record.Name), record, nil)
 	return nil
 }
 
@@ -1318,13 +1555,7 @@ func handleImport(application *app.App, args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("已导入账号 %q\n", record.Name)
-	if record.Snapshot.AccountName != "" {
-		fmt.Printf("账户名: %s\n", record.Snapshot.AccountName)
-	}
-	if record.Snapshot.Email != "" {
-		fmt.Printf("邮箱: %s\n", record.Snapshot.Email)
-	}
+	printAccountSnapshot(uiForApp(application), fmt.Sprintf("已导入账号 %q", record.Name), record, nil)
 	return nil
 }
 
@@ -1343,7 +1574,7 @@ func handleList(application *app.App, args []string) error {
 		return err
 	}
 	if len(records) == 0 {
-		fmt.Println("还没有保存任何账号，先执行 `codex-switch add <名称>`。")
+		uiForApp(application).Println(uiForApp(application).sectionTitle("还没有保存任何账号，先执行 `codex-switch add <名称>`。"))
 		return nil
 	}
 
@@ -1356,31 +1587,19 @@ func handleList(application *app.App, args []string) error {
 		return strings.ToLower(records[i].Name) < strings.ToLower(records[j].Name)
 	})
 
-	for _, record := range records {
-		marker := " "
-		if current.Managed != nil && strings.EqualFold(current.Managed.Name, record.Name) {
-			marker = "*"
+	ui := uiForApp(application)
+	ui.Println(ui.sectionTitle("已保存账号"))
+	for index, record := range records {
+		if index > 0 {
+			ui.Println("")
 		}
-
-		label := buildRecordLabel(record)
-
-		fmt.Printf("%s %s\n", marker, label)
-		fmt.Printf("  类型: %s\n", displayOr(record.Snapshot.AuthMode, "unknown"))
-		if record.Snapshot.AccountName != "" && !strings.EqualFold(record.Snapshot.AccountName, record.Name) {
-			fmt.Printf("  账户名: %s\n", record.Snapshot.AccountName)
-		}
-		if record.Snapshot.Plan != "" {
-			fmt.Printf("  套餐: %s\n", record.Snapshot.Plan)
-		}
-		if record.Snapshot.AccountID != "" {
-			fmt.Printf("  account_id: %s\n", record.Snapshot.AccountID)
-		}
-		if shellName := store.ShellName(record.Name); shellName != "" && !strings.EqualFold(shellName, record.Name) {
-			fmt.Printf("  命令别名: %s\n", shellName)
-		}
-		fmt.Printf("  保存时间: %s\n", record.SavedAt.Local().Format("2006-01-02 15:04:05"))
+		currentRecord := current.Managed != nil && strings.EqualFold(current.Managed.Name, record.Name)
+		printAccountRecordCard(ui, record, currentRecord, [][2]string{
+			{"类型", displayOr(record.Snapshot.AuthMode, "unknown")},
+			{"保存时间", record.SavedAt.Local().Format("2006-01-02 15:04:05")},
+		})
 		if !record.LastSwitchedAt.IsZero() {
-			fmt.Printf("  最近切换: %s\n", record.LastSwitchedAt.Local().Format("2006-01-02 15:04:05"))
+			ui.Println(formatDetailLine(ui, "最近切换", record.LastSwitchedAt.Local().Format("2006-01-02 15:04:05")))
 		}
 	}
 
@@ -1392,35 +1611,42 @@ func handleCurrent(application *app.App) error {
 	if err != nil {
 		return err
 	}
+	ui := uiForApp(application)
 	if status.Live == nil {
-		fmt.Println("当前活动 auth path 中没有 auth.json。")
-		fmt.Printf("Auth path: %s\n", application.ActiveAuthPath)
+		ui.Println(ui.sectionTitle("当前活动 auth path 中没有 auth.json。"))
+		ui.Println(formatDetailLine(ui, "Auth path", application.ActiveAuthPath))
 		return nil
 	}
 
-	fmt.Printf("当前活动 Home: %s\n", application.ActiveHome)
-	fmt.Printf("Auth path: %s\n", application.ActiveAuthPath)
-	fmt.Printf("Config path: %s\n", application.ActiveConfigPath)
-	fmt.Printf("认证类型: %s\n", displayOr(status.Live.AuthMode, "unknown"))
+	ui.Println(ui.sectionTitle("当前活动账号"))
+	liveTitle := displayOr(status.Live.AccountName, "当前账号")
+	badges := []string{planBadge(ui, status.Live.Plan)}
+	if status.Managed != nil {
+		badges = append(badges, ui.badge("saved", "success"))
+	} else {
+		badges = append(badges, ui.badge("untracked", "warning"))
+	}
+	ui.Println(formatItemHeader(ui, status.Managed != nil, liveTitle, badges...))
 	if status.Live.AccountName != "" {
-		fmt.Printf("账户名: %s\n", status.Live.AccountName)
+		ui.Println(formatDetailLine(ui, "账户名", status.Live.AccountName))
 	}
 	if status.Live.Email != "" {
-		fmt.Printf("邮箱: %s\n", status.Live.Email)
+		ui.Println(formatDetailLine(ui, "邮箱", status.Live.Email))
 	}
-	if status.Live.Plan != "" {
-		fmt.Printf("套餐: %s\n", status.Live.Plan)
-	}
+	ui.Println(formatDetailLine(ui, "认证类型", displayOr(status.Live.AuthMode, "unknown")))
 	if status.Live.AccountID != "" {
-		fmt.Printf("account_id: %s\n", status.Live.AccountID)
+		ui.Println(formatDetailLine(ui, "account_id", status.Live.AccountID))
 	}
 	if !status.Live.ExpiresAt.IsZero() {
-		fmt.Printf("Token 过期时间: %s\n", status.Live.ExpiresAt.Local().Format("2006-01-02 15:04:05"))
+		ui.Println(formatDetailLine(ui, "Token 过期", status.Live.ExpiresAt.Local().Format("2006-01-02 15:04:05")))
 	}
+	ui.Println(formatDetailLine(ui, "Home", application.ActiveHome))
+	ui.Println(formatDetailLine(ui, "Auth path", application.ActiveAuthPath))
+	ui.Println(formatDetailLine(ui, "Config path", application.ActiveConfigPath))
 	if status.Managed != nil {
-		fmt.Printf("已匹配到已保存账号: %s\n", status.Managed.Name)
+		ui.Println(formatDetailLine(ui, "已匹配账号", status.Managed.Name))
 	} else {
-		fmt.Println("未匹配到已保存账号。")
+		ui.Println(formatDetailLine(ui, "状态", "未匹配到已保存账号"))
 	}
 	return nil
 }
@@ -1440,7 +1666,7 @@ func handleStatus(application *app.App, args []string) error {
 		return err
 	}
 	if len(statuses) == 0 {
-		fmt.Println("还没有保存任何账号，先执行 `codex-switch add`。")
+		uiForApp(application).Println(uiForApp(application).sectionTitle("还没有保存任何账号，先执行 `codex-switch add`。"))
 		return nil
 	}
 
@@ -1448,32 +1674,40 @@ func handleStatus(application *app.App, args []string) error {
 		return strings.ToLower(statuses[i].Record.Name) < strings.ToLower(statuses[j].Record.Name)
 	})
 
-	for _, item := range statuses {
-		marker := " "
-		if item.Current {
-			marker = "*"
+	ui := uiForApp(application)
+	ui.Println(ui.sectionTitle("账号额度"))
+	for index, item := range statuses {
+		if index > 0 {
+			ui.Println("")
 		}
-		fmt.Printf("%s %s\n", marker, buildRecordLabel(item.Record))
-		if item.Record.Snapshot.Plan != "" {
-			fmt.Printf("  套餐: %s\n", item.Record.Snapshot.Plan)
+		badges := []string{planBadge(ui, item.Record.Snapshot.Plan), aliasBadge(ui, item.Record.Name)}
+		if item.Current {
+			badges = append(badges, ui.badge("current", "success"))
 		}
 		if item.Refreshed {
-			fmt.Printf("  Token: 已自动刷新\n")
+			badges = append(badges, ui.badge("token refreshed", "accent"))
+		}
+		ui.Println(formatItemHeader(ui, item.Current, item.Record.Name, badges...))
+		if item.Record.Snapshot.AccountName != "" && !strings.EqualFold(item.Record.Snapshot.AccountName, item.Record.Name) {
+			ui.Println(formatDetailLine(ui, "账户名", item.Record.Snapshot.AccountName))
+		}
+		if item.Record.Snapshot.Email != "" {
+			ui.Println(formatDetailLine(ui, "邮箱", item.Record.Snapshot.Email))
 		}
 		if item.Error != "" {
-			fmt.Printf("  状态: %s\n", item.Error)
+			ui.Println(formatDetailLine(ui, "状态", ui.danger(item.Error)))
 			continue
 		}
-		fmt.Printf("  5小时额度: %d%%", item.Quota.Hourly.RemainingPercent)
+		hourly := formatQuotaValue(ui, item.Quota.Hourly.RemainingPercent)
 		if !item.Quota.Hourly.ResetAt.IsZero() {
-			fmt.Printf("  重置: %s", item.Quota.Hourly.ResetAt.Local().Format("2006-01-02 15:04:05"))
+			hourly += "  " + ui.muted("重置 "+item.Quota.Hourly.ResetAt.Local().Format("2006-01-02 15:04:05"))
 		}
-		fmt.Println()
-		fmt.Printf("  周额度: %d%%", item.Quota.Weekly.RemainingPercent)
+		ui.Println(formatDetailLine(ui, "5小时额度", hourly))
+		weekly := formatQuotaValue(ui, item.Quota.Weekly.RemainingPercent)
 		if !item.Quota.Weekly.ResetAt.IsZero() {
-			fmt.Printf("  重置: %s", item.Quota.Weekly.ResetAt.Local().Format("2006-01-02 15:04:05"))
+			weekly += "  " + ui.muted("重置 "+item.Quota.Weekly.ResetAt.Local().Format("2006-01-02 15:04:05"))
 		}
-		fmt.Println()
+		ui.Println(formatDetailLine(ui, "周额度", weekly))
 	}
 	return nil
 }
@@ -1513,16 +1747,7 @@ func handleSwitch(application *app.App, args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Printf("已登录并保存账号 %q\n", record.Name)
-		if record.Snapshot.AccountName != "" {
-			fmt.Printf("账户名: %s\n", record.Snapshot.AccountName)
-		}
-		if record.Snapshot.Email != "" {
-			fmt.Printf("邮箱: %s\n", record.Snapshot.Email)
-		}
-		if record.Snapshot.Plan != "" {
-			fmt.Printf("套餐: %s\n", record.Snapshot.Plan)
-		}
+		printAccountSnapshot(uiForApp(application), fmt.Sprintf("已登录并保存账号 %q", record.Name), record, nil)
 		return nil
 	}
 
@@ -1533,31 +1758,16 @@ func handleSwitch(application *app.App, args []string) error {
 			if promptErr != nil {
 				return promptErr
 			}
-			fmt.Printf("已登录并保存账号 %q\n", record.Name)
-			if record.Snapshot.AccountName != "" {
-				fmt.Printf("账户名: %s\n", record.Snapshot.AccountName)
-			}
-			if record.Snapshot.Email != "" {
-				fmt.Printf("邮箱: %s\n", record.Snapshot.Email)
-			}
-			if record.Snapshot.Plan != "" {
-				fmt.Printf("套餐: %s\n", record.Snapshot.Plan)
-			}
+			printAccountSnapshot(uiForApp(application), fmt.Sprintf("已登录并保存账号 %q", record.Name), record, nil)
 			return nil
 		}
 		return withSwitchLoginHint(err, name)
 	}
-	fmt.Printf("已切换到账号 %q\n", record.Name)
-	if record.Snapshot.AccountName != "" {
-		fmt.Printf("账户名: %s\n", record.Snapshot.AccountName)
-	}
-	if record.Snapshot.Email != "" {
-		fmt.Printf("邮箱: %s\n", record.Snapshot.Email)
-	}
+	extras := [][2]string{{"目标 auth", application.ActiveAuthPath}}
 	if backupPath != "" {
-		fmt.Printf("切换前备份: %s\n", backupPath)
+		extras = append(extras, [2]string{"切换前备份", backupPath})
 	}
-	fmt.Printf("目标 auth.json: %s\n", application.ActiveAuthPath)
+	printAccountSnapshot(uiForApp(application), fmt.Sprintf("已切换到账号 %q", record.Name), record, extras)
 	return nil
 }
 
@@ -1589,7 +1799,7 @@ func handleRemove(application *app.App, args []string) error {
 	if err := application.Remove(name); err != nil {
 		return err
 	}
-	fmt.Printf("已删除账号 %q\n", name)
+	uiForApp(application).Println(uiForApp(application).sectionTitle(fmt.Sprintf("已删除账号 %q", name)))
 	return nil
 }
 
@@ -1642,7 +1852,9 @@ func handleRename(application *app.App, args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("已将账号 %q 重命名为 %q\n", oldName, record.Name)
+	ui := uiForApp(application)
+	ui.Println(ui.sectionTitle(fmt.Sprintf("已将账号 %q 重命名为 %q", oldName, record.Name)))
+	printAccountRecordCard(ui, *record, false, nil)
 	return nil
 }
 
@@ -1683,7 +1895,9 @@ func handleExport(application *app.App, args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("已将账号 %q 导出到 %s\n", record.Name, targetPath)
+	ui := uiForApp(application)
+	ui.Println(ui.sectionTitle(fmt.Sprintf("已将账号 %q 导出到 %s", record.Name, targetPath)))
+	printAccountRecordCard(ui, *record, false, [][2]string{{"导出路径", targetPath}})
 	return nil
 }
 
@@ -1730,10 +1944,13 @@ func handleExportHome(application *app.App, args []string) error {
 		return err
 	}
 
-	fmt.Printf("已导出账号 %q 到 %s\n", record.Name, targetHome)
-	fmt.Printf("可用以下方式启动隔离实例:\n")
-	fmt.Printf("  %s\n", shellEnvSetCommand(runtime.GOOS, "CODEX_HOME", targetHome))
-	fmt.Printf("  codex\n")
+	ui := uiForApp(application)
+	ui.Println(ui.sectionTitle(fmt.Sprintf("已导出账号 %q 到 %s", record.Name, targetHome)))
+	printAccountRecordCard(ui, *record, false, [][2]string{{"导出 Home", targetHome}})
+	ui.Println("")
+	ui.Println(ui.sectionTitle("可用以下方式启动隔离实例"))
+	ui.Println(formatDetailLine(ui, "Step 1", shellEnvSetCommand(runtime.GOOS, "CODEX_HOME", targetHome)))
+	ui.Println(formatDetailLine(ui, "Step 2", "codex"))
 	return nil
 }
 
@@ -1782,7 +1999,9 @@ func handleRun(application *app.App, args []string) error {
 		return err
 	}
 
-	fmt.Printf("已使用隔离 home 启动 Codex: %s\n", targetHome)
+	ui := uiForApp(application)
+	ui.Println(ui.sectionTitle("已使用隔离 home 启动 Codex"))
+	ui.Println(formatDetailLine(ui, "Home", targetHome))
 	return nil
 }
 
@@ -1791,6 +2010,37 @@ func displayOr(value, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func printAccountSnapshot(ui terminalUI, title string, record *store.Record, extras [][2]string) {
+	if record == nil {
+		return
+	}
+	ui.Println(ui.sectionTitle(title))
+	printAccountRecordCard(ui, *record, false, extras)
+}
+
+func printAccountRecordCard(ui terminalUI, record store.Record, current bool, extras [][2]string) {
+	badges := []string{planBadge(ui, record.Snapshot.Plan), aliasBadge(ui, record.Name)}
+	if current {
+		badges = append(badges, ui.badge("current", "success"))
+	}
+	ui.Println(formatItemHeader(ui, current, record.Name, badges...))
+	if record.Snapshot.AccountName != "" && !strings.EqualFold(record.Snapshot.AccountName, record.Name) {
+		ui.Println(formatDetailLine(ui, "账户名", record.Snapshot.AccountName))
+	}
+	if record.Snapshot.Email != "" {
+		ui.Println(formatDetailLine(ui, "邮箱", record.Snapshot.Email))
+	}
+	if record.Snapshot.AccountID != "" {
+		ui.Println(formatDetailLine(ui, "account_id", record.Snapshot.AccountID))
+	}
+	for _, extra := range extras {
+		if len(extra) < 2 || strings.TrimSpace(extra[1]) == "" {
+			continue
+		}
+		ui.Println(formatDetailLine(ui, extra[0], extra[1]))
+	}
 }
 
 func maybePromptSwitchLogin(application *app.App, err error, name string, force bool) (*store.Record, bool, error) {
@@ -1807,13 +2057,13 @@ func maybePromptSwitchLogin(application *app.App, err error, name string, force 
 	if application.Stdout != nil {
 		writer = application.Stdout
 	}
-	if _, writeErr := fmt.Fprintf(writer, "账号 %q 还未保存，是否现在登录并保存？ [y/N]: ", name); writeErr != nil {
+	ui := newTerminalUI(writer)
+	if _, writeErr := fmt.Fprintf(writer, "%s %q 还未保存，是否现在登录并保存？ %s: ", ui.accent("? 账号"), name, ui.muted("[y/N]")); writeErr != nil {
 		return nil, false, nil
 	}
 
-	reader := inputReader(application)
-	line, readErr := reader.ReadString('\n')
-	if readErr != nil && readErr != io.EOF {
+	line, readErr := readPromptLine(application)
+	if readErr != nil {
 		return nil, false, nil
 	}
 	answer := strings.ToLower(strings.TrimSpace(line))
@@ -1858,30 +2108,45 @@ func promptAccountSelection(application *app.App, header string) (string, error)
 	if application.Stdout != nil {
 		writer = application.Stdout
 	}
+	ui := newTerminalUI(writer)
 
-	if _, err := fmt.Fprintln(writer, header); err != nil {
+	if _, err := fmt.Fprintln(writer, ui.sectionTitle(header)); err != nil {
 		return "", err
 	}
 	for index, record := range records {
-		marker := " "
-		if current.Managed != nil && strings.EqualFold(current.Managed.Name, record.Name) {
-			marker = "*"
+		currentRecord := current.Managed != nil && strings.EqualFold(current.Managed.Name, record.Name)
+		badges := []string{planBadge(ui, record.Snapshot.Plan), aliasBadge(ui, record.Name)}
+		if currentRecord {
+			badges = append(badges, ui.badge("current", "success"))
 		}
-		alias := ""
-		if shellName := store.ShellName(record.Name); shellName != "" && !strings.EqualFold(shellName, record.Name) {
-			alias = " [" + shellName + "]"
-		}
-		if _, err := fmt.Fprintf(writer, "  %d. %s %s%s\n", index+1, marker, buildRecordLabel(record), alias); err != nil {
+		if _, err := fmt.Fprintf(writer, "  %d. %s\n", index+1, formatItemHeader(ui, currentRecord, record.Name, badges...)); err != nil {
 			return "", err
 		}
+		if record.Snapshot.Email != "" {
+			if _, err := fmt.Fprintln(writer, "     "+formatDetailLine(ui, "邮箱", record.Snapshot.Email)); err != nil {
+				return "", err
+			}
+		}
+		if record.Snapshot.AccountName != "" && !strings.EqualFold(record.Snapshot.AccountName, record.Name) {
+			if _, err := fmt.Fprintln(writer, "     "+formatDetailLine(ui, "账户名", record.Snapshot.AccountName)); err != nil {
+				return "", err
+			}
+		}
+		if index < len(records)-1 {
+			if _, err := fmt.Fprintln(writer); err != nil {
+				return "", err
+			}
+		}
+	}
+	if _, err := fmt.Fprintf(writer, "%s ", ui.accent(">")); err != nil {
+		return "", err
 	}
 	if _, err := fmt.Fprint(writer, "输入序号或名称，直接回车取消: "); err != nil {
 		return "", err
 	}
 
-	reader := inputReader(application)
-	line, readErr := reader.ReadString('\n')
-	if readErr != nil && readErr != io.EOF {
+	line, readErr := readPromptLine(application)
+	if readErr != nil {
 		return "", readErr
 	}
 	input := strings.TrimSpace(line)
@@ -1904,13 +2169,13 @@ func confirmAccountAction(application *app.App, prompt string) (bool, error) {
 	if application.Stdout != nil {
 		writer = application.Stdout
 	}
-	if _, err := fmt.Fprint(writer, prompt); err != nil {
+	ui := newTerminalUI(writer)
+	if _, err := fmt.Fprintf(writer, "%s %s", ui.accent("?"), prompt); err != nil {
 		return false, err
 	}
 
-	reader := inputReader(application)
-	line, readErr := reader.ReadString('\n')
-	if readErr != nil && readErr != io.EOF {
+	line, readErr := readPromptLine(application)
+	if readErr != nil {
 		return false, readErr
 	}
 	answer := strings.ToLower(strings.TrimSpace(line))
@@ -1926,13 +2191,13 @@ func promptTextInput(application *app.App, prompt string) (string, error) {
 	if application.Stdout != nil {
 		writer = application.Stdout
 	}
-	if _, err := fmt.Fprint(writer, prompt); err != nil {
+	ui := newTerminalUI(writer)
+	if _, err := fmt.Fprintf(writer, "%s %s", ui.accent(">"), prompt); err != nil {
 		return "", err
 	}
 
-	reader := inputReader(application)
-	line, readErr := reader.ReadString('\n')
-	if readErr != nil && readErr != io.EOF {
+	line, readErr := readPromptLine(application)
+	if readErr != nil {
 		return "", readErr
 	}
 	value := strings.TrimSpace(line)
@@ -1949,9 +2214,10 @@ func inputReader(application *app.App) *bufio.Reader {
 	if reader, ok := application.Stdin.(*bufio.Reader); ok {
 		return reader
 	}
-	reader := bufio.NewReader(application.Stdin)
-	application.Stdin = reader
-	return reader
+	if application.InputReader == nil {
+		application.InputReader = bufio.NewReader(application.Stdin)
+	}
+	return application.InputReader
 }
 
 func parseSelectionIndex(input string, count int) (int, error) {

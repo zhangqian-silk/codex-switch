@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
@@ -23,6 +24,7 @@ type App struct {
 	ActivePathSource  string
 	ActivePathProfile string
 	Stdin             io.Reader
+	InputReader       *bufio.Reader
 	Stdout            io.Writer
 	Stderr            io.Writer
 }
