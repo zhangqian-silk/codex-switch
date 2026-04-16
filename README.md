@@ -99,14 +99,13 @@ codex-switch paths reset
 Run `codex-switch` with no arguments to enter the interactive shell.
 
 - Commands must start with `/`, such as `/help`, `/switch`, `/exit`
-- Supports command prefix matching such as `/sw`, `/st`, `/ren`
 - Shows live command suggestions while you type in a real terminal
-- Supports `Tab` to complete the selected command
+- Supports `Tab` to accept the selected completion
 - Supports `Up` / `Down` to move through suggestions
+- After moving with `Up` / `Down`, pressing `Enter` accepts the highlighted suggestion
 - Supports `Right Arrow` to accept the selected completion
 - Supports `Esc` to hide the suggestion list
 - Shows grouped suggestions for commands, accounts, and path profiles
-- Shows candidate commands when a prefix is ambiguous
 - Typing `/` prints the available command list
 - Shows inline parameter hints for commands such as `/paths add`, `/run`, and `/export-home`
 - Displays the current context in the prompt, for example `codex-switch[work]>` or `codex-switch[untracked]>`
