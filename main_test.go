@@ -11,6 +11,7 @@ import (
 
 	"codex-switch/internal/app"
 	"codex-switch/internal/store"
+	"golang.org/x/term"
 )
 
 func TestHandleSwitchSuggestsLoginForUnknownAccount(t *testing.T) {
@@ -380,6 +381,9 @@ func TestHandleExportUsesDefaultPathWhenInputIsBlank(t *testing.T) {
 	if !strings.Contains(stdout.String(), absolutePathOrOriginal(want)) {
 		t.Fatalf("expected export output to include absolute path, got %q", stdout.String())
 	}
+	if filepath.Dir(want) == "." {
+		t.Fatalf("expected default export path to stay inside a directory, got %q", want)
+	}
 }
 
 func TestHandleExportHomePromptsForSelectionAndDirectory(t *testing.T) {
@@ -472,6 +476,44 @@ func TestHandleExportHomeCanSelectDefaultDirectoryByIndex(t *testing.T) {
 	want := defaultExportHomePaths(application, "work")[1]
 	if selectedDir != want {
 		t.Fatalf("expected default export-home dir %q, got %q", want, selectedDir)
+	}
+}
+
+func TestDefaultExportPathsStayInsideDirectories(t *testing.T) {
+	tempDir := t.TempDir()
+	activeHome := filepath.Join(tempDir, "active")
+	storeHome := filepath.Join(tempDir, "store")
+
+	t.Setenv("CODEX_HOME", activeHome)
+	t.Setenv("CODEX_SWITCH_HOME", storeHome)
+
+	if err := os.MkdirAll(activeHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	application, err := app.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	authPaths := defaultExportAuthPaths(application, "work")
+	if len(authPaths) == 0 {
+		t.Fatal("expected default auth export paths")
+	}
+	for _, path := range authPaths {
+		if filepath.Dir(path) == "." {
+			t.Fatalf("expected auth export path to stay inside a directory, got %q", path)
+		}
+	}
+
+	homePaths := defaultExportHomePaths(application, "work")
+	if len(homePaths) == 0 {
+		t.Fatal("expected default home export paths")
+	}
+	for _, path := range homePaths {
+		if filepath.Dir(path) == "." {
+			t.Fatalf("expected home export path to stay inside a directory, got %q", path)
+		}
 	}
 }
 
@@ -720,6 +762,84 @@ func TestInputReaderCachesBufferedReaderWithoutReplacingStdin(t *testing.T) {
 	}
 	if line != "second\n" {
 		t.Fatalf("expected second line, got %q", line)
+	}
+}
+
+func TestSuspendRealtimeShellRawModeHandlesNestedSuspends(t *testing.T) {
+	input, err := os.CreateTemp(t.TempDir(), "tty-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer input.Close()
+
+	originalState := &term.State{}
+	rawState := &term.State{}
+	restoreCalls := 0
+	makeRawCalls := 0
+
+	previousMakeRaw := termMakeRaw
+	previousRestore := termRestore
+	termMakeRaw = func(fd int) (*term.State, error) {
+		makeRawCalls++
+		return originalState, nil
+	}
+	termRestore = func(fd int, state *term.State) error {
+		restoreCalls++
+		if state != originalState {
+			t.Fatalf("expected restore to use original state, got %p", state)
+		}
+		return nil
+	}
+	defer func() {
+		termMakeRaw = previousMakeRaw
+		termRestore = previousRestore
+		activeRealtimeShellSession = nil
+	}()
+
+	activeRealtimeShellSession = &realtimeShellSession{
+		input: input,
+		state: originalState,
+	}
+	application := &app.App{Stdin: input}
+
+	resumeOuter, err := suspendRealtimeShellRawMode(application)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumeInner, err := suspendRealtimeShellRawMode(application)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restoreCalls != 1 {
+		t.Fatalf("expected one restore call for nested suspends, got %d", restoreCalls)
+	}
+	if activeRealtimeShellSession.suspendDepth != 2 {
+		t.Fatalf("expected suspend depth 2, got %d", activeRealtimeShellSession.suspendDepth)
+	}
+
+	if err := resumeInner(); err != nil {
+		t.Fatal(err)
+	}
+	if makeRawCalls != 0 {
+		t.Fatalf("expected inner resume to skip MakeRaw, got %d calls", makeRawCalls)
+	}
+	if activeRealtimeShellSession.suspendDepth != 1 {
+		t.Fatalf("expected suspend depth 1 after inner resume, got %d", activeRealtimeShellSession.suspendDepth)
+	}
+
+	activeRealtimeShellSession.state = rawState
+
+	if err := resumeOuter(); err != nil {
+		t.Fatal(err)
+	}
+	if makeRawCalls != 1 {
+		t.Fatalf("expected outer resume to call MakeRaw once, got %d", makeRawCalls)
+	}
+	if activeRealtimeShellSession.suspendDepth != 0 {
+		t.Fatalf("expected suspend depth 0 after outer resume, got %d", activeRealtimeShellSession.suspendDepth)
+	}
+	if activeRealtimeShellSession.state != originalState {
+		t.Fatalf("expected final session state to stay original, got %p", activeRealtimeShellSession.state)
 	}
 }
 

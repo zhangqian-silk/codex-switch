@@ -61,11 +61,15 @@ type realtimeSuggestionItem struct {
 }
 
 type realtimeShellSession struct {
-	input *os.File
-	state *term.State
+	input        *os.File
+	state        *term.State
+	suspendDepth int
 }
 
 var activeRealtimeShellSession *realtimeShellSession
+
+var termMakeRaw = term.MakeRaw
+var termRestore = term.Restore
 
 var errExitInteractiveShell = errors.New("exit interactive shell")
 
@@ -410,7 +414,7 @@ func runRealtimeInteractiveShell(application *app.App) error {
 		return runLineInteractiveShell(application, outputFile)
 	}
 
-	state, err := term.MakeRaw(int(inputFile.Fd()))
+	state, err := termMakeRaw(int(inputFile.Fd()))
 	if err != nil {
 		return runLineInteractiveShell(application, outputFile)
 	}
@@ -420,7 +424,7 @@ func runRealtimeInteractiveShell(application *app.App) error {
 	}
 	defer func() {
 		activeRealtimeShellSession = nil
-		_ = term.Restore(int(inputFile.Fd()), state)
+		_ = termRestore(int(inputFile.Fd()), state)
 		fmt.Fprint(outputFile, "\r\n")
 	}()
 
@@ -1160,15 +1164,30 @@ func suspendRealtimeShellRawMode(application *app.App) (func() error, error) {
 		return func() error { return nil }, nil
 	}
 
-	if err := term.Restore(int(session.input.Fd()), session.state); err != nil {
-		return nil, err
+	if session.suspendDepth > 0 {
+		session.suspendDepth++
+		return func() error {
+			session.suspendDepth--
+			return nil
+		}, nil
 	}
 
+	if err := termRestore(int(session.input.Fd()), session.state); err != nil {
+		return nil, err
+	}
+	session.suspendDepth = 1
+
 	return func() error {
-		state, err := term.MakeRaw(int(session.input.Fd()))
+		if session.suspendDepth > 1 {
+			session.suspendDepth--
+			return nil
+		}
+
+		state, err := termMakeRaw(int(session.input.Fd()))
 		if err != nil {
 			return err
 		}
+		session.suspendDepth = 0
 		session.state = state
 		return nil
 	}, nil
@@ -2110,7 +2129,6 @@ func uniquePaths(paths []string) []string {
 func defaultExportAuthPaths(application *app.App, name string) []string {
 	base := defaultExportBaseName(name)
 	paths := []string{
-		base + "-auth.json",
 		filepath.Join("exports", base+"-auth.json"),
 	}
 	if application != nil && application.Store != nil {
@@ -2122,7 +2140,6 @@ func defaultExportAuthPaths(application *app.App, name string) []string {
 func defaultExportHomePaths(application *app.App, name string) []string {
 	base := "codex-" + defaultExportBaseName(name)
 	paths := []string{
-		base,
 		filepath.Join("exports", base),
 	}
 	if application != nil && application.Store != nil {
@@ -2141,10 +2158,8 @@ func exportAuthPathSuggestionItems(application *app.App, name string) []realtime
 		summary := "默认导出 auth.json 路径"
 		switch index {
 		case 0:
-			summary = "默认: 当前目录"
-		case 1:
 			summary = "默认: 当前目录 exports"
-		case 2:
+		case 1:
 			summary = "默认: codex-switch store exports"
 		}
 		items = append(items, realtimeSuggestionItem{
@@ -2166,10 +2181,8 @@ func exportHomePathSuggestionItems(application *app.App, name string) []realtime
 		summary := "默认导出 home 路径"
 		switch index {
 		case 0:
-			summary = "默认: 当前目录"
-		case 1:
 			summary = "默认: 当前目录 exports"
-		case 2:
+		case 1:
 			summary = "默认: codex-switch store exports"
 		}
 		items = append(items, realtimeSuggestionItem{
