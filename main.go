@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -65,6 +66,8 @@ type realtimeShellSession struct {
 }
 
 var activeRealtimeShellSession *realtimeShellSession
+
+var errExitInteractiveShell = errors.New("exit interactive shell")
 
 type terminalUI struct {
 	writer io.Writer
@@ -239,9 +242,14 @@ func run(args []string) error {
 		return err
 	}
 	if len(args) == 0 {
-		return runInteractiveShell(application)
+		err = runInteractiveShell(application)
+	} else {
+		err = runWithApp(application, args)
 	}
-	return runWithApp(application, args)
+	if errors.Is(err, errExitInteractiveShell) {
+		return nil
+	}
+	return err
 }
 
 func runWithApp(application *app.App, args []string) error {
@@ -418,11 +426,11 @@ func runRealtimeInteractiveShell(application *app.App) error {
 
 	buffer := make([]byte, 0, 128)
 	renderedLines := 0
-	selectedSuggestion := 0
+	selectedSuggestion := -1
 	selectionArmed := false
 	suggestionsVisible := true
 	for {
-		renderedLines, selectedSuggestion, err = renderInteractiveInput(outputFile, renderedLines, application, interactiveShellPrompt(application), string(buffer), selectedSuggestion, suggestionsVisible)
+		renderedLines, selectedSuggestion, err = renderInteractiveInput(outputFile, renderedLines, application, interactiveShellPrompt(application), string(buffer), selectedSuggestion, selectionArmed, suggestionsVisible)
 		if err != nil {
 			return err
 		}
@@ -437,12 +445,15 @@ func runRealtimeInteractiveShell(application *app.App) error {
 
 		switch b[0] {
 		case '\r', '\n':
-			buffer = applySelectedSuggestionOnEnter(application, buffer, selectedSuggestion, selectionArmed, suggestionsVisible)
+			executionLine := interactiveExecutionLine(application, buffer, selectedSuggestion, selectionArmed, suggestionsVisible)
+			if renderedLines, _, err = renderInteractiveInput(outputFile, renderedLines, application, interactiveShellPrompt(application), executionLine, -1, false, false); err != nil {
+				return err
+			}
 			fmt.Fprint(outputFile, "\r\n")
 			renderedLines = 0
-			line := strings.TrimSpace(string(buffer))
+			line := strings.TrimSpace(executionLine)
 			buffer = buffer[:0]
-			selectedSuggestion = 0
+			selectedSuggestion = -1
 			selectionArmed = false
 			suggestionsVisible = true
 			if line == "" {
@@ -461,7 +472,7 @@ func runRealtimeInteractiveShell(application *app.App) error {
 			if len(buffer) > 0 {
 				buffer = buffer[:len(buffer)-1]
 			}
-			selectedSuggestion = 0
+			selectedSuggestion = -1
 			selectionArmed = false
 			suggestionsVisible = true
 		case '\t':
@@ -469,7 +480,7 @@ func runRealtimeInteractiveShell(application *app.App) error {
 			if completed != string(buffer) {
 				buffer = []byte(completed)
 			}
-			selectedSuggestion = 0
+			selectedSuggestion = -1
 			selectionArmed = false
 			suggestionsVisible = true
 		case 27:
@@ -489,7 +500,7 @@ func runRealtimeInteractiveShell(application *app.App) error {
 					buffer = []byte(completed)
 				}
 				suggestionsVisible = true
-				selectedSuggestion = 0
+				selectedSuggestion = -1
 				selectionArmed = false
 			case "escape":
 				suggestionsVisible = false
@@ -500,7 +511,7 @@ func runRealtimeInteractiveShell(application *app.App) error {
 			if b[0] >= 32 && b[0] != 255 {
 				buffer = append(buffer, b[0])
 				suggestionsVisible = true
-				selectedSuggestion = 0
+				selectedSuggestion = -1
 				selectionArmed = false
 			}
 		}
@@ -533,6 +544,9 @@ func handleInteractiveLine(application *app.App, writer io.Writer, line string) 
 	}
 
 	if runErr := runInteractiveShellCommand(application, args); runErr != nil {
+		if errors.Is(runErr, errExitInteractiveShell) {
+			return true, nil
+		}
 		_, _ = fmt.Fprintf(writer, "错误: %v\n", runErr)
 	}
 	return false, nil
@@ -579,13 +593,17 @@ func interactiveOutputFile(application *app.App) *os.File {
 	return os.Stdout
 }
 
-func renderInteractiveInput(writer io.Writer, previousLines int, application *app.App, prompt, line string, selected int, visible bool) (int, int, error) {
+func renderInteractiveInput(writer io.Writer, previousLines int, application *app.App, prompt, line string, selected int, armed, visible bool) (int, int, error) {
 	ui := newTerminalUI(writer)
 	suggestions := interactiveRealtimeSuggestions(application, line)
 	if !visible {
 		suggestions = realtimeCommandSuggestions{}
 	}
-	selected = normalizeSuggestionSelection(len(suggestions.Matches), selected)
+	if armed {
+		selected = normalizeSuggestionSelection(len(suggestions.Matches), selected)
+	} else {
+		selected = -1
+	}
 	lines := renderInteractiveSuggestionLines(ui, suggestions, selected)
 	if previousLines > 0 {
 		if _, err := fmt.Fprintf(writer, "\x1b[%dA", previousLines); err != nil {
@@ -793,6 +811,12 @@ func moveSuggestionSelectionWithApp(application *app.App, line string, selected,
 	if count == 0 {
 		return -1
 	}
+	if selected < 0 || selected >= count {
+		if delta < 0 {
+			return count - 1
+		}
+		return 0
+	}
 	selected = normalizeSuggestionSelection(count, selected)
 	selected += delta
 	if selected < 0 {
@@ -810,7 +834,9 @@ func autocompleteInteractiveLine(application *app.App, line string, selected int
 		return line
 	}
 
-	selected = normalizeSuggestionSelection(len(suggestions.Matches), selected)
+	if selected < 0 || selected >= len(suggestions.Matches) {
+		selected = 0
+	}
 	value := suggestions.Matches[selected].Value
 	trimmedRight := strings.TrimRight(line, " \t")
 	if !strings.HasPrefix(strings.TrimSpace(trimmedRight), "/") {
@@ -834,6 +860,11 @@ func applySelectedSuggestionOnEnter(application *app.App, buffer []byte, selecte
 		return buffer
 	}
 	return []byte(completed)
+}
+
+func interactiveExecutionLine(application *app.App, buffer []byte, selected int, armed, visible bool) string {
+	line := string(applySelectedSuggestionOnEnter(application, buffer, selected, armed, visible))
+	return strings.TrimRight(line, " \t")
 }
 
 func interactiveCompletionRange(line string) (int, int) {
@@ -1162,6 +1193,17 @@ func readPromptLine(application *app.App) (line string, err error) {
 	return line, nil
 }
 
+func promptControlAction(line string) string {
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "/exit", "/quit", "/q", "退出", "/退出":
+		return "exit"
+	case "/cancel", "取消", "/取消":
+		return "cancel"
+	default:
+		return ""
+	}
+}
+
 func resolveInteractiveCommand(application *app.App, input string) (string, error) {
 	query := strings.ToLower(strings.TrimSpace(input))
 	if query == "" {
@@ -1236,13 +1278,19 @@ func promptCommandSelection(application *app.App, prefix string, matches []shell
 	}
 
 	for {
-		if _, err := fmt.Fprint(writer, "输入序号或命令名，直接回车取消: "); err != nil {
+		if _, err := fmt.Fprint(writer, "输入序号或命令名，回车或 /cancel 取消，/exit 退出: "); err != nil {
 			return "", err
 		}
 
 		line, readErr := readPromptLine(application)
 		if readErr != nil {
 			return "", readErr
+		}
+		switch promptControlAction(line) {
+		case "exit":
+			return "", errExitInteractiveShell
+		case "cancel":
+			return "", fmt.Errorf("已取消命令选择")
 		}
 		input := strings.ToLower(strings.TrimSpace(line))
 		if input == "" {
@@ -2160,13 +2208,19 @@ func promptTextInputWithDefaults(application *app.App, prompt string, defaults [
 			return "", err
 		}
 	}
-	if _, err := fmt.Fprintf(writer, "%s 直接回车使用默认值，也可输入序号或自定义路径: ", ui.accent(">")); err != nil {
+	if _, err := fmt.Fprintf(writer, "%s 回车用默认值，也可输入序号、自定义路径、/cancel 取消或 /exit 退出: ", ui.accent(">")); err != nil {
 		return "", err
 	}
 
 	line, readErr := readPromptLine(application)
 	if readErr != nil {
 		return "", readErr
+	}
+	switch promptControlAction(line) {
+	case "exit":
+		return "", errExitInteractiveShell
+	case "cancel":
+		return "", fmt.Errorf("已取消输入")
 	}
 	value := strings.TrimSpace(line)
 	if value == "" {
@@ -2266,13 +2320,19 @@ func maybePromptSwitchLogin(application *app.App, err error, name string, force 
 		writer = application.Stdout
 	}
 	ui := newTerminalUI(writer)
-	if _, writeErr := fmt.Fprintf(writer, "%s %q 还未保存，是否现在登录并保存？ %s: ", ui.accent("? 账号"), name, ui.muted("[y/N]")); writeErr != nil {
+	if _, writeErr := fmt.Fprintf(writer, "%s %q 还未保存，是否现在登录并保存？ %s: ", ui.accent("? 账号"), name, ui.muted("[y/N, /cancel, /exit]")); writeErr != nil {
 		return nil, false, nil
 	}
 
 	line, readErr := readPromptLine(application)
 	if readErr != nil {
 		return nil, false, nil
+	}
+	switch promptControlAction(line) {
+	case "exit":
+		return nil, true, errExitInteractiveShell
+	case "cancel":
+		return nil, true, fmt.Errorf("已取消登录")
 	}
 	answer := strings.ToLower(strings.TrimSpace(line))
 	if answer != "y" && answer != "yes" {
@@ -2349,13 +2409,19 @@ func promptAccountSelection(application *app.App, header string) (string, error)
 	if _, err := fmt.Fprintf(writer, "%s ", ui.accent(">")); err != nil {
 		return "", err
 	}
-	if _, err := fmt.Fprint(writer, "输入序号或名称，直接回车取消: "); err != nil {
+	if _, err := fmt.Fprint(writer, "输入序号或名称，回车或 /cancel 取消，/exit 退出: "); err != nil {
 		return "", err
 	}
 
 	line, readErr := readPromptLine(application)
 	if readErr != nil {
 		return "", readErr
+	}
+	switch promptControlAction(line) {
+	case "exit":
+		return "", errExitInteractiveShell
+	case "cancel":
+		return "", fmt.Errorf("已取消切换")
 	}
 	input := strings.TrimSpace(line)
 	if input == "" {
@@ -2378,13 +2444,22 @@ func confirmAccountAction(application *app.App, prompt string) (bool, error) {
 		writer = application.Stdout
 	}
 	ui := newTerminalUI(writer)
-	if _, err := fmt.Fprintf(writer, "%s %s", ui.accent("?"), prompt); err != nil {
+	if _, err := fmt.Fprintf(writer, "%s %s", ui.accent("?"), strings.TrimRight(prompt, " ")); err != nil {
+		return false, err
+	}
+	if _, err := fmt.Fprint(writer, ui.muted(" [输入 /cancel 取消，/exit 退出]: ")); err != nil {
 		return false, err
 	}
 
 	line, readErr := readPromptLine(application)
 	if readErr != nil {
 		return false, readErr
+	}
+	switch promptControlAction(line) {
+	case "exit":
+		return false, errExitInteractiveShell
+	case "cancel":
+		return false, fmt.Errorf("已取消操作")
 	}
 	answer := strings.ToLower(strings.TrimSpace(line))
 	return answer == "y" || answer == "yes", nil
@@ -2400,13 +2475,22 @@ func promptTextInput(application *app.App, prompt string) (string, error) {
 		writer = application.Stdout
 	}
 	ui := newTerminalUI(writer)
-	if _, err := fmt.Fprintf(writer, "%s %s", ui.accent(">"), prompt); err != nil {
+	if _, err := fmt.Fprintf(writer, "%s %s", ui.accent(">"), strings.TrimRight(prompt, " ")); err != nil {
+		return "", err
+	}
+	if _, err := fmt.Fprint(writer, ui.muted(" (/cancel 取消，/exit 退出): ")); err != nil {
 		return "", err
 	}
 
 	line, readErr := readPromptLine(application)
 	if readErr != nil {
 		return "", readErr
+	}
+	switch promptControlAction(line) {
+	case "exit":
+		return "", errExitInteractiveShell
+	case "cancel":
+		return "", fmt.Errorf("已取消重命名")
 	}
 	value := strings.TrimSpace(line)
 	if value == "" {

@@ -89,6 +89,48 @@ func TestHandleSwitchCanStartLoginFlowAfterPrompt(t *testing.T) {
 	}
 }
 
+func TestHandleSwitchCanCancelLoginFlowAfterPrompt(t *testing.T) {
+	tempDir := t.TempDir()
+	activeHome := filepath.Join(tempDir, "active")
+	storeHome := filepath.Join(tempDir, "store")
+
+	t.Setenv("CODEX_HOME", activeHome)
+	t.Setenv("CODEX_SWITCH_HOME", storeHome)
+
+	if err := os.MkdirAll(activeHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	application, err := app.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	application.Stdin = bytes.NewBufferString("/cancel\n")
+	var stdout bytes.Buffer
+	application.Stdout = &stdout
+
+	previousLogin := loginAccount
+	called := false
+	loginAccount = func(application *app.App, name string, force bool) (*store.Record, error) {
+		called = true
+		return nil, nil
+	}
+	defer func() {
+		loginAccount = previousLogin
+	}()
+
+	err = handleSwitch(application, []string{"new-account"})
+	if err == nil || !strings.Contains(err.Error(), "已取消登录") {
+		t.Fatalf("expected login prompt cancellation, got %v", err)
+	}
+	if called {
+		t.Fatal("expected cancellation to skip login flow")
+	}
+	if !strings.Contains(stdout.String(), "/cancel") || !strings.Contains(stdout.String(), "/exit") {
+		t.Fatalf("expected prompt to mention cancel and exit, got %q", stdout.String())
+	}
+}
+
 func TestHandleSwitchPromptsForSelectionWhenNoNameProvided(t *testing.T) {
 	tempDir := t.TempDir()
 	activeHome := filepath.Join(tempDir, "active")
@@ -591,6 +633,45 @@ func TestInteractiveShellRejectsCommandPrefixOnEnter(t *testing.T) {
 	}
 }
 
+func TestInteractiveShellCanExitFromSelectionPrompt(t *testing.T) {
+	tempDir := t.TempDir()
+	activeHome := filepath.Join(tempDir, "active")
+	storeHome := filepath.Join(tempDir, "store")
+
+	t.Setenv("CODEX_HOME", activeHome)
+	t.Setenv("CODEX_SWITCH_HOME", storeHome)
+
+	if err := os.MkdirAll(activeHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(activeHome, "auth.json"), buildMainTestOAuthAuth(t, "Work", "work@example.com", "acct-work", "user-work"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	application, err := app.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := application.AddCurrent("work", false); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout bytes.Buffer
+	application.Stdin = bytes.NewBufferString("/switch\n/exit\n")
+	application.Stdout = &stdout
+	application.Stderr = &stdout
+
+	if err := runInteractiveShell(application); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout.String(), "请选择要切换的账号") {
+		t.Fatalf("expected selection prompt, got %q", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "错误: exit interactive shell") {
+		t.Fatalf("expected prompt exit to stay quiet, got %q", stdout.String())
+	}
+}
+
 func TestInteractiveShellRejectsAmbiguousCommandPrefixOnEnter(t *testing.T) {
 	var stdout bytes.Buffer
 	fakeApp := &app.App{
@@ -831,12 +912,42 @@ func TestApplySelectedSuggestionOnEnterDoesNotAutocompleteWithoutArrowSelection(
 	}
 }
 
+func TestInteractiveExecutionLineUsesSelectedSuggestionWithoutTrailingSpace(t *testing.T) {
+	if got := interactiveExecutionLine(nil, []byte("/r"), 1, true, true); got != "/rename" {
+		t.Fatalf("expected execution line to show selected command, got %q", got)
+	}
+}
+
+func TestInteractiveExecutionLineHidesSuggestionsForTypedInput(t *testing.T) {
+	if got := interactiveExecutionLine(nil, []byte("/status"), -1, false, true); got != "/status" {
+		t.Fatalf("expected execution line to preserve typed command, got %q", got)
+	}
+}
+
+func TestRenderInteractiveSuggestionLinesDoesNotHighlightWithoutSelection(t *testing.T) {
+	lines := renderInteractiveSuggestionLines(terminalUI{}, interactiveRealtimeSuggestions(nil, "/"), -1)
+	for _, line := range lines {
+		if strings.Contains(line, "\x1b[7m") {
+			t.Fatalf("expected no highlighted suggestion without selection, got %q", line)
+		}
+	}
+}
+
 func TestMoveSuggestionSelectionWraps(t *testing.T) {
 	if got := moveSuggestionSelection("/", 0, -1); got != len(interactiveShellCommands)-1 {
 		t.Fatalf("expected selection to wrap to last command, got %d", got)
 	}
 	if got := moveSuggestionSelection("/r", 0, 1); got != 1 {
 		t.Fatalf("expected selection to advance, got %d", got)
+	}
+}
+
+func TestMoveSuggestionSelectionStartsFromEdgesWhenUnselected(t *testing.T) {
+	if got := moveSuggestionSelection("/", -1, -1); got != len(interactiveShellCommands)-1 {
+		t.Fatalf("expected first up from unselected to wrap to last command, got %d", got)
+	}
+	if got := moveSuggestionSelection("/", -1, 1); got != 0 {
+		t.Fatalf("expected first down from unselected to select first command, got %d", got)
 	}
 }
 

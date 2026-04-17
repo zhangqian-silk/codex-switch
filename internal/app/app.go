@@ -3,11 +3,13 @@ package app
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"time"
@@ -59,8 +61,17 @@ type commandIO struct {
 
 var lookupCommand = exec.LookPath
 
+var errCommandInterrupted = errors.New("external command interrupted")
+
+var notifyInterruptContext = func() (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(context.Background(), os.Interrupt)
+}
+
 var runCommand = func(name string, args []string, options commandIO) error {
-	cmd := exec.Command(name, args...)
+	ctx, stop := notifyInterruptContext()
+	defer stop()
+
+	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = options.Dir
 	if len(options.Env) > 0 {
 		cmd.Env = options.Env
@@ -68,7 +79,44 @@ var runCommand = func(name string, args []string, options commandIO) error {
 	cmd.Stdin = options.Stdin
 	cmd.Stdout = options.Stdout
 	cmd.Stderr = options.Stderr
-	return cmd.Run()
+	return normalizeCommandRunError(name, cmd.Run(), ctx.Err())
+}
+
+func normalizeCommandRunError(name string, runErr error, ctxErr error) error {
+	if runErr == nil {
+		return nil
+	}
+	if isInterruptedCommandError(runErr, ctxErr) {
+		return fmt.Errorf("%w: %s", errCommandInterrupted, filepath.Base(name))
+	}
+	return runErr
+}
+
+func isInterruptedCommandError(runErr error, ctxErr error) bool {
+	if ctxErr != nil {
+		return true
+	}
+	if runErr == nil {
+		return false
+	}
+	var exitErr *exec.ExitError
+	if errors.As(runErr, &exitErr) {
+		switch exitErr.ExitCode() {
+		case 130, 3221225786, -1073741510:
+			return true
+		}
+	}
+	return strings.Contains(strings.ToLower(runErr.Error()), "signal: interrupt")
+}
+
+func wrapExternalCommandError(label string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, errCommandInterrupted) {
+		return fmt.Errorf("已中断 %s", label)
+	}
+	return fmt.Errorf("执行 %s 失败: %w", label, err)
 }
 
 func New() (*App, error) {
@@ -316,7 +364,7 @@ func (a *App) Login(name string, overwrite bool) (*store.Record, error) {
 			Stdout: a.Stdout,
 			Stderr: a.Stderr,
 		}); err != nil {
-			return nil, fmt.Errorf("执行 codex logout 失败: %w", err)
+			return nil, wrapExternalCommandError("codex logout", err)
 		}
 	case err != nil && !errors.Is(err, os.ErrNotExist):
 		return nil, err
@@ -334,7 +382,7 @@ func (a *App) Login(name string, overwrite bool) (*store.Record, error) {
 		Stdout: a.Stdout,
 		Stderr: a.Stderr,
 	}); err != nil {
-		return nil, fmt.Errorf("执行 codex login 失败: %w", err)
+		return nil, wrapExternalCommandError("codex login", err)
 	}
 
 	return a.AddCurrent(name, overwrite)
@@ -448,7 +496,7 @@ func (a *App) Run(name string, opts RunOptions) (string, error) {
 		Stdout: a.Stdout,
 		Stderr: a.Stderr,
 	}); err != nil {
-		return "", err
+		return "", wrapExternalCommandError("codex 命令", err)
 	}
 	return targetHome, nil
 }

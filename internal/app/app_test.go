@@ -2,9 +2,11 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -582,6 +584,75 @@ func TestLoginFailsBeforeRunningCommandsWhenNameExists(t *testing.T) {
 
 	if _, err := application.Login("existing", false); err == nil {
 		t.Fatal("expected name conflict error")
+	}
+}
+
+func TestNormalizeCommandRunErrorMapsCanceledContextToInterruptedError(t *testing.T) {
+	err := normalizeCommandRunError("codex.exe", errors.New("killed"), context.Canceled)
+	if !errors.Is(err, errCommandInterrupted) {
+		t.Fatalf("expected interrupted command sentinel, got %v", err)
+	}
+}
+
+func TestLoginReturnsFriendlyErrorWhenCommandInterrupted(t *testing.T) {
+	tempDir := t.TempDir()
+	activeHome := filepath.Join(tempDir, "active")
+	storeHome := filepath.Join(tempDir, "store")
+
+	t.Setenv("CODEX_HOME", activeHome)
+	t.Setenv("CODEX_SWITCH_HOME", storeHome)
+
+	if err := os.MkdirAll(activeHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	application, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	restoreLookup, restoreRun := stubCodexCommands(t, activeHome, func(args []string, options commandIO) error {
+		return fmt.Errorf("%w: codex.exe", errCommandInterrupted)
+	})
+	defer restoreLookup()
+	defer restoreRun()
+
+	if _, err := application.Login("work", false); err == nil || !strings.Contains(err.Error(), "已中断 codex login") {
+		t.Fatalf("expected friendly interrupted login error, got %v", err)
+	}
+}
+
+func TestRunReturnsFriendlyErrorWhenCommandInterrupted(t *testing.T) {
+	tempDir := t.TempDir()
+	activeHome := filepath.Join(tempDir, "active")
+	storeHome := filepath.Join(tempDir, "store")
+
+	t.Setenv("CODEX_HOME", activeHome)
+	t.Setenv("CODEX_SWITCH_HOME", storeHome)
+
+	if err := os.MkdirAll(activeHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(activeHome, "auth.json"), buildOAuthAuth(t, "Work Account", "work@example.com", "acct-work", "user-work", "plus"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	application, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := application.AddCurrent("work", false); err != nil {
+		t.Fatal(err)
+	}
+
+	restoreLookup, restoreRun := stubCodexCommands(t, activeHome, func(args []string, options commandIO) error {
+		return fmt.Errorf("%w: codex.exe", errCommandInterrupted)
+	})
+	defer restoreLookup()
+	defer restoreRun()
+
+	if _, err := application.Run("work", RunOptions{}); err == nil || !strings.Contains(err.Error(), "已中断 codex 命令") {
+		t.Fatalf("expected friendly interrupted run error, got %v", err)
 	}
 }
 
